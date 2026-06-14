@@ -263,11 +263,17 @@ class BatchedEngine(BaseEngine):
                 model, processor = custom_loaded
                 return model, getattr(processor, "tokenizer", processor)
 
-            return load(
-                self._model_name,
-                tokenizer_config=tokenizer_config,
-                trust_remote_code=self._trust_remote_code,
-            )
+            # mlx-lm >=0.31 dropped `trust_remote_code` from load(); pass it only
+            # if the installed loader still accepts it, so a dependency bump can't
+            # break standard-LLM serving loads (the mlx-vlm/diffusion path uses a
+            # separate loader and is unaffected). See the 2026-06-13 regression:
+            # the DiffusionGemma build pulled mlx-lm 0.31.3, whose load() rejects
+            # this kwarg, which TypeError'd every coder/LLM load (e.g. Lucy).
+            import inspect as _inspect
+            _load_kwargs = {"tokenizer_config": tokenizer_config}
+            if "trust_remote_code" in _inspect.signature(load).parameters:
+                _load_kwargs["trust_remote_code"] = self._trust_remote_code
+            return load(self._model_name, **_load_kwargs)
 
         loop = asyncio.get_running_loop()
         self._model, self._tokenizer = await loop.run_in_executor(
