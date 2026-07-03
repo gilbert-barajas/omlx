@@ -58,6 +58,11 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
+        elastic_load: Load weights as file-backed PROT_READ mmap views
+            (zero-copy, OS-reclaimable) instead of materialized copies.
+            Weights become read-only and Metal wiring is disabled
+            process-wide while an elastic model is loaded. Requires the
+            _elastic_mmap native extension; see omlx/elastic/README.md.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -128,6 +133,11 @@ class ModelSettings:
     turboquant_kv_enabled: bool = False
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
     turboquant_skip_last: bool = True  # Skip last KVCache layer (prevents corruption on sensitive models)
+
+    # Elastic (mmap) weight loading — file-backed zero-copy weights the OS can
+    # evict + refault under pressure. Read-only weights; disables Metal wiring
+    # process-wide while loaded. See omlx/elastic/README.md.
+    elastic_load: bool = False
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

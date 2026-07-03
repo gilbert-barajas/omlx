@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 import psutil
 
+from .elastic import state as elastic_state
 from .utils.proc_memory import get_phys_footprint
 
 if TYPE_CHECKING:
@@ -223,8 +224,22 @@ def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
     cap. The scheduler still clamps against get_effective_metal_cap_bytes();
     this only avoids changing MLX allocator state unless the user explicitly
     raised the kernel cap.
+
+    Elastic guard: when an elastic (mmap) model is loaded in this process,
+    the wired limit must stay at 0 — MLX's residency set would wire the
+    file-backed weight mappings and defeat their evictability. The elastic
+    loader clamps the limit and blocks raises via omlx.elastic.state; we
+    honor that here.
     """
     if desired_bytes <= 0:
+        return 0, None
+
+    if elastic_state.wiring_blocked():
+        logger.info(
+            "Skipping Metal wired-limit raise (%s requested): %s",
+            _format_gb(desired_bytes),
+            elastic_state.wiring_blocked_reason(),
+        )
         return 0, None
 
     sysctl_cap = get_iogpu_wired_limit_bytes()

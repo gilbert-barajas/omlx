@@ -273,6 +273,28 @@ class BatchedEngine(BaseEngine):
             _load_kwargs = {"tokenizer_config": tokenizer_config}
             if "trust_remote_code" in _inspect.signature(load).parameters:
                 _load_kwargs["trust_remote_code"] = self._trust_remote_code
+
+            # Elastic (mmap) weight loading — per-model opt-in, default OFF.
+            # When off, this branch is never taken and omlx.elastic is never
+            # imported: behavior is identical to the standard load below.
+            if getattr(self._model_settings, "elastic_load", False):
+                from .. import elastic
+
+                if not elastic.is_available():
+                    logger.error(
+                        "elastic_load=true for %s but the _elastic_mmap "
+                        "native extension is not built; falling back to the "
+                        "standard (non-elastic) loader. Build it with: "
+                        "scripts/build-elastic-ext.sh",
+                        self._model_name,
+                    )
+                else:
+                    # One-time realign for 100% zero-copy views; header-only
+                    # no-op scan on already-aligned checkpoints.
+                    elastic.ensure_realigned(self._model_name)
+                    with elastic.elastic_load_scope(self._model_name):
+                        return load(self._model_name, **_load_kwargs)
+
             return load(self._model_name, **_load_kwargs)
 
         loop = asyncio.get_running_loop()
