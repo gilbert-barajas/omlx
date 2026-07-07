@@ -80,6 +80,26 @@ from . import cache_rollback as _rollback_mod
 
 logger = logging.getLogger(__name__)
 
+# --- FP-exactness receipt instrumentation (env-gated, zero cost when off) ---
+import os as _os
+_MTP_TRACE_PATH = _os.environ.get("OMLX_MTP_TRACE")
+
+def _emit_gap(lp_1d):
+    try:
+        import mlx.core as mx
+        s = mx.sort(lp_1d)
+        return float((s[-1] - s[-2]).item())
+    except Exception:
+        return -1.0
+
+def _trace_tok(tok_id, gap, kind):
+    if _MTP_TRACE_PATH:
+        try:
+            with open(_MTP_TRACE_PATH, "a") as _f:
+                _f.write(f"{int(tok_id)}\t{gap:.6f}\t{kind}\n")
+        except Exception:
+            pass
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -1554,6 +1574,9 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         # bonus uses the verify forward's bonus distribution.
         state.queue.append((draft_id, state.draft_lp, "draft"))
         state.queue.append((bonus_id, bonus_lp_2d.squeeze(0), "bonus"))
+        if _MTP_TRACE_PATH:
+            _trace_tok(draft_id, _emit_gap(verify_lp_2d.squeeze(0)), "accept")
+            _trace_tok(bonus_id, _emit_gap(bonus_lp_2d.squeeze(0)), "bonus")
         state.next_main = _ensure_uint32(bonus_tok)
         state.draft_tok = new_draft
         state.draft_lp = new_draft_lp
@@ -1601,6 +1624,8 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     )
 
     state.queue.append((emit_id, emit_lp, "verify"))
+    if _MTP_TRACE_PATH:
+        _trace_tok(emit_id, _emit_gap(emit_lp), "reject")
     state.next_main = emit_tok
     state.draft_tok = new_draft
     state.draft_lp = new_draft_lp
