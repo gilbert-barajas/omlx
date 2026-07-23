@@ -1005,18 +1005,63 @@ class TestDeepSeekV4SanitizeAffineSwitchMLP:
 
         assert out["model.layers.0.ffn.switch_mlp.up_proj.scales"].dtype == mx.float16
         assert out["model.layers.0.ffn.switch_mlp.up_proj.biases"].dtype == mx.float16
+        assert out["model.layers.0.ffn.switch_mlp.down_proj.scales"].dtype == mx.float16
+        assert out["model.layers.0.ffn.switch_mlp.down_proj.biases"].dtype == mx.float16
         assert (
-            out["model.layers.0.ffn.switch_mlp.down_proj.scales"].dtype
-            == mx.float16
+            out["model.layers.0.ffn.shared_experts.up_proj.scales"].dtype == mx.bfloat16
         )
-        assert (
-            out["model.layers.0.ffn.switch_mlp.down_proj.biases"].dtype
-            == mx.float16
+
+
+class TestDeepSeekV4SanitizeHcAliases:
+    """Sanitize accepts both upstream HC key spellings for V4 checkpoints."""
+
+    @staticmethod
+    def _fake_model():
+        return SimpleNamespace(
+            args=SimpleNamespace(
+                num_hidden_layers=1,
+                n_routed_experts=0,
+                o_groups=1,
+                o_lora_rank=1,
+            )
         )
-        assert (
-            out["model.layers.0.ffn.shared_experts.up_proj.scales"].dtype
-            == mx.bfloat16
-        )
+
+    def test_dotted_hc_aliases_remap_to_model_modules(self, applied_patch):
+        mx = pytest.importorskip("mlx.core")
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        weights = {
+            "model.layers.0.hc_attn.base": mx.zeros((1,), dtype=mx.float32),
+            "model.layers.0.hc_attn.fn": mx.zeros((1, 1), dtype=mx.float32),
+            "model.layers.0.hc_attn.scale": mx.zeros((3,), dtype=mx.float32),
+            "model.layers.0.hc_ffn.base": mx.zeros((1,), dtype=mx.float32),
+            "model.layers.0.hc_ffn.fn": mx.zeros((1, 1), dtype=mx.float32),
+            "model.layers.0.hc_ffn.scale": mx.zeros((3,), dtype=mx.float32),
+        }
+
+        out = dsv4.Model.sanitize(self._fake_model(), dict(weights))
+
+        assert "model.layers.0.attn_hc.base" in out
+        assert "model.layers.0.attn_hc.fn" in out
+        assert "model.layers.0.attn_hc.scale" in out
+        assert "model.layers.0.ffn_hc.base" in out
+        assert "model.layers.0.ffn_hc.fn" in out
+        assert "model.layers.0.ffn_hc.scale" in out
+        assert not any(".hc_attn." in key or ".hc_ffn." in key for key in out)
+
+    def test_dotted_hc_alias_does_not_override_canonical_key(self, applied_patch):
+        mx = pytest.importorskip("mlx.core")
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        weights = {
+            "model.layers.0.hc_attn.base": mx.zeros((1,), dtype=mx.float32),
+            "model.layers.0.attn_hc.base": mx.zeros((2,), dtype=mx.float32),
+        }
+
+        out = dsv4.Model.sanitize(self._fake_model(), dict(weights))
+
+        assert out["model.layers.0.attn_hc.base"].shape == (2,)
+        assert "model.layers.0.hc_attn.base" not in out
 
 
 class TestMtpSanitizeWoAReshape:
@@ -1065,6 +1110,21 @@ class TestMtpSanitizeWoAReshape:
         }
         out = patched_sanitize(self._fake_model(), weights)
         assert out["mtp.0.block.attn.wo_a.weight"].shape == (2, 4, 16)
+
+    def test_mtp_dotted_hc_alias_nested_under_block(self, patched_sanitize):
+        import mlx.core as mx
+
+        weights = {
+            "mtp.0.hc_attn.base": mx.zeros((1,), dtype=mx.float32),
+            "mtp.0.hc_ffn.scale": mx.zeros((3,), dtype=mx.float32),
+        }
+
+        out = patched_sanitize(self._fake_model(), weights)
+
+        assert "mtp.0.block.attn_hc.base" in out
+        assert "mtp.0.block.ffn_hc.scale" in out
+        assert "mtp.0.hc_attn.base" not in out
+        assert "mtp.0.hc_ffn.scale" not in out
 
 
 class TestMtpBackboneInterface:
@@ -1201,14 +1261,95 @@ class TestPoolingCacheTrimRollback:
         )
 
     def test_untrimmable_when_no_undo_after_prompt(self, applied_patch):
-        """Prompt-sized updates (L > 2) don't stash an undo log; a trim at
+        """Prompt-sized updates (L > 8) don't stash an undo log; a trim at
         a pool boundary right after one must report not-trimmable instead
-        of corrupting state."""
+        of corrupting state. (Updates up to L == 8 keep an undo so depth-k
+        MTP verify windows can roll back.)"""
+        from mlx_lm.models.cache import PoolingCache
+
+        cache = PoolingCache(4)
+        self._push(
+            cache,
+            self._tok([float(v) for v in range(1, 13)]),  # L = 12 > 8
+            0,
+        )
+        assert cache.remainder == 0
+        assert cache.pooled is not None
+        assert not cache.is_trimmable()
+        assert cache.trim(1) == 0
+
+    def test_verify_sized_update_keeps_undo(self, applied_patch):
+        """MTP verify windows (2 < L <= 8) stash an undo log: a trim right
+        after one rolls back across the pool boundary instead of failing."""
         from mlx_lm.models.cache import PoolingCache
 
         cache = PoolingCache(4)
         self._push(cache, self._tok([1.0, 2.0, 3.0, 4.0]), 0)
         assert cache.remainder == 0
         assert cache.pooled is not None
-        assert not cache.is_trimmable()
-        assert cache.trim(1) == 0
+        assert cache.is_trimmable()
+        assert cache.trim(1) == 1
+        # The completed window is undone: its 3 surviving tokens are back
+        # in the remainder buffer and no pooled row remains visible.
+        assert cache.remainder == 3
+        assert cache.size() == 0
+
+
+class TestNaxMoEStockRouting:
+    """NAX GPUs route prefill-sized MoE gemms to stock mx.gather_qmm."""
+
+    @pytest.fixture(autouse=True)
+    def _nax_off_by_default(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        # Pin detection off so the block-kernel tests behave identically on
+        # M5-family machines; each test overrides what it needs.
+        monkeypatch.setattr(sl, "is_nax_available", lambda: False)
+        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "")
+        yield
+
+    def test_prefers_stock_for_prefill_route_counts_only(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
+        assert not sl._nax_prefers_stock(8)
+        assert not sl._nax_prefers_stock(sl._NAX_STOCK_MIN_ROUTES - 1)
+        assert sl._nax_prefers_stock(sl._NAX_STOCK_MIN_ROUTES)
+        assert sl._nax_prefers_stock(1 << 20)
+
+    def test_no_stock_routing_without_nax(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        assert not sl._nax_prefers_stock(1 << 20)
+
+    def test_env_kill_switch_keeps_block_kernels(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
+        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "0")
+        assert not sl._nax_prefers_stock(1 << 20)
+
+    def test_env_force_routes_everything(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
+        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "1")
+        assert sl._nax_prefers_stock(1)
+
+    def test_native_block_kind_short_circuits_on_nax_prefill(self, monkeypatch):
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        linear = sl.QuantizedSwitchLinear(
+            64, 64, num_experts=2, bias=False, group_size=64, bits=4
+        )
+        monkeypatch.setattr(sl, "_nax_prefers_stock", lambda n: n >= 1024)
+        prefill_x = mx.zeros((2048, 1, 64), dtype=mx.bfloat16)
+        assert linear._native_block_kind(prefill_x, True) is None
+        # Decode-sized calls fall through to the regular block-kernel gates:
+        # the NAX gate must not change what they resolve to.
+        decode_x = mx.zeros((8, 1, 64), dtype=mx.bfloat16)
+        gated = linear._native_block_kind(decode_x, True)
+        monkeypatch.setattr(sl, "_nax_prefers_stock", lambda n: False)
+        assert gated == linear._native_block_kind(decode_x, True)

@@ -698,6 +698,59 @@ class TestOutputParserFactory:
         assert factory is not None
         assert factory.kind == "gemma4"
 
+    def test_session_receives_model_path_when_provided(self, monkeypatch):
+        """Since #2178 the scheduler's model_name is a display id, so the
+        filesystem path must reach parser sessions via model_path."""
+        import omlx.adapter.output_parser as output_parser_module
+
+        seen = {}
+
+        class RecordingSession:
+            def __init__(self, tokenizer, model_path=None):
+                seen["model_path"] = model_path
+
+        monkeypatch.setattr(
+            output_parser_module, "MiniMaxM3OutputParserSession", RecordingSession
+        )
+        tokenizer = CohereTokenizer({})
+        tokenizer.convert_tokens_to_ids = lambda text: -1
+        tokenizer.unk_token_id = -1
+
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+            model_path="/models/minimax-m3",
+        )
+        factory.create_session(tokenizer)
+        assert seen["model_path"] == "/models/minimax-m3"
+
+    def test_session_falls_back_to_model_name_without_model_path(self, monkeypatch):
+        """dflash/vlm engines pass their filesystem path as model_name and no
+        model_path, so the session fallback must keep using model_name."""
+        import omlx.adapter.output_parser as output_parser_module
+
+        seen = {}
+
+        class RecordingSession:
+            def __init__(self, tokenizer, model_path=None):
+                seen["model_path"] = model_path
+
+        monkeypatch.setattr(
+            output_parser_module, "MiniMaxM3OutputParserSession", RecordingSession
+        )
+        tokenizer = CohereTokenizer({})
+        tokenizer.convert_tokens_to_ids = lambda text: -1
+        tokenizer.unk_token_id = -1
+
+        factory = detect_output_parser(
+            "/models/MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+        factory.create_session(tokenizer)
+        assert seen["model_path"] == "/models/MiniMax-M3-4bit"
+
     def test_detects_gemma4_unified_by_config(self):
         tokenizer = GemmaTokenizer({1: "x"})
         factory = detect_output_parser(

@@ -1102,3 +1102,64 @@ def test_glm_cachelist_hot_and_cold_round_trip(tmp_path):
         assert cold_manager._hot_cache_get(block_hash) is not None
     finally:
         cold_manager.close()
+
+
+def test_glm_indexer_decode_rows_skip_fused_scores_kernel(monkeypatch):
+    """MTP verify forwards (tiny multi-row decode) must not enter the
+    prefill-shaped fused indexer scores kernel (issue #2160): it runs ~5x
+    slower than the matmul + fused reduce fallback at tiny row counts and
+    the gap grows with context length."""
+    mx = pytest.importorskip("mlx.core")
+    glm_moe_dsa = _load_patched_glm_module()
+
+    from mlx_lm.models.cache import KVCache
+
+    from omlx.patches.glm_moe_dsa import deepseek_v32 as dsv32
+
+    assert dsv32._FUSED_SCORES_MIN_S == 16
+
+    args = _small_glm_args(glm_moe_dsa)
+    indexer = dsv32.Indexer(args)
+    mx.eval(indexer.parameters())
+
+    fused_calls = []
+    real_fused = dsv32.fused_indexer_scores
+
+    def counting_fused(*a, **kw):
+        fused_calls.append(a[0].shape)
+        return real_fused(*a, **kw)
+
+    monkeypatch.setattr(dsv32, "fused_indexer_scores", counting_fused)
+
+    def causal_mask(s, total):
+        q_pos = mx.arange(total - s, total)[:, None]
+        k_pos = mx.arange(total)[None, :]
+        return k_pos <= q_pos
+
+    cache = KVCache()
+    hidden = args.hidden_size
+
+    # Prefill-shaped call (s >= floor) still routes through the fused kernel.
+    s0 = 16
+    x0 = mx.random.normal((1, s0, hidden)).astype(mx.bfloat16)
+    qr0 = mx.random.normal((1, s0, args.q_lora_rank)).astype(mx.bfloat16)
+    out0 = indexer(x0, qr0, causal_mask(s0, s0), cache=cache)
+    mx.eval(out0 if not isinstance(out0, tuple) else out0[0])
+    assert len(fused_calls) == 1
+
+    # Decode-verify-shaped call (1 < s < floor) must skip the fused kernel
+    # and still produce causally valid top-k indices.
+    s1 = 3
+    x1 = mx.random.normal((1, s1, hidden)).astype(mx.bfloat16)
+    qr1 = mx.random.normal((1, s1, args.q_lora_rank)).astype(mx.bfloat16)
+    total = s0 + s1
+    out1 = indexer(x1, qr1, causal_mask(s1, total), cache=cache)
+    assert len(fused_calls) == 1
+
+    idx = out1[0] if isinstance(out1, tuple) else out1
+    assert idx is not None
+    mx.eval(idx)
+    assert idx.shape == (1, 1, s1, args.index_topk)
+    for row in range(s1):
+        row_pos = total - s1 + row
+        assert max(idx[0, 0, row].tolist()) <= row_pos

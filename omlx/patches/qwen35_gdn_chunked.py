@@ -18,7 +18,8 @@ masked/vectorized paths keep the original kernel.
 Toggles:
   OMLX_GDN_KERNEL=0    disable the patch entirely
   OMLX_GDN_IMPL=...    blocked_seq (default) | chunked
-  OMLX_GDN_BLOCK_T=N   blocked_seq time block: 16 | 32 | 48 (default 32)
+  OMLX_GDN_BLOCK_T=N   blocked_seq time block: 16 | 32 | 48
+                         (default 16 for float32, 32 otherwise)
   OMLX_GDN_MIN_T=N     minimum prefill length to engage (default 64)
   OMLX_GDN_FUSED_G_BETA=1
                          use mlx-vlm's Metal g/beta precompute helper

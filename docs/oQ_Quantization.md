@@ -190,6 +190,9 @@ Code samples include real-world patterns (class definitions, import chains, mult
 ### Streaming Path (oQ)
 
 All models supported by mlx-lm/mlx-vlm. No architecture restrictions.
+Source checkpoints may use BF16/FP16 or reconstructable floating-point block
+formats, including native FP8 and MXFP8. oQ restores FP8/MXFP8 weight semantics
+from the checkpoint scales before applying the selected oQ or oQe format.
 
 ## Acknowledgments
 

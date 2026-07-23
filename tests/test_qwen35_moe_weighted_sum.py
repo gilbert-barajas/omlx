@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import types
 
 import mlx.core as mx
 import pytest
+
+from omlx.request import Request, SamplingParams
+from omlx.scheduler import Scheduler, SchedulerConfig
 
 
 class _Switch:
@@ -69,6 +73,78 @@ def test_moe_weighted_sum_route_gate(monkeypatch):
     sharded = _Block()
     sharded.sharding_group = object()
     assert not patch._should_route(sharded, x, False, min_tokens=1024)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
+def test_external_prefill_evaluates_native_weighted_sum_on_engine_stream():
+    """The issue #2170 native op must stay on the per-engine worker stream."""
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    if not fast.has_symbol("qwen35_moe_weighted_sum"):
+        pytest.skip("qwen35_moe_weighted_sum native kernel unavailable")
+
+    observed_streams = []
+
+    class NativeWeightedSumModel:
+        model_type = "test"
+        config = types.SimpleNamespace(model_type="test")
+
+        def parameters(self):
+            return {}
+
+        def __call__(self, inputs, cache, **kwargs):
+            observed_streams.append(mx.default_stream(mx.gpu))
+            tokens = inputs.shape[1]
+            topk = 6
+            rows = tokens * topk
+            x_sorted = mx.ones((rows, 1, 128), dtype=mx.float16)
+            inv_order = mx.arange(rows, dtype=mx.uint32)
+            scores = mx.ones((tokens, topk), dtype=mx.float32) / topk
+            cache[0].state = fast.qwen35_moe_weighted_sum(
+                x_sorted,
+                inv_order,
+                scores,
+            )
+
+    class Tokenizer:
+        eos_token_id = 2
+        pad_token_id = 0
+        bos_token_id = 1
+
+        def encode(self, text, add_special_tokens=True):
+            return [1]
+
+        def decode(self, token_ids, skip_special_tokens=True):
+            return ""
+
+    stream = mx.new_thread_local_stream(mx.default_device())
+    scheduler = Scheduler(
+        model=NativeWeightedSumModel(),
+        tokenizer=Tokenizer(),
+        config=SchedulerConfig(prefill_step_size=2048),
+        stream=stream,
+    )
+    tokens = [1] * 1025
+    request = Request(
+        request_id="qwen-moe-native-stream",
+        prompt=tokens,
+        sampling_params=SamplingParams(),
+    )
+    request.prompt_token_ids = tokens
+    request.num_prompt_tokens = len(tokens)
+    cache = [types.SimpleNamespace(state=mx.array([0]))]
+
+    def run_prefill():
+        with mx.stream(stream):
+            expected_engine_stream = mx.default_stream(mx.gpu)
+        scheduler._do_external_prefill(request, tokens, cache)
+        return expected_engine_stream, cache[0].state[0, 0].item()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        expected_engine_stream, result = executor.submit(run_prefill).result()
+
+    assert observed_streams == [expected_engine_stream]
+    assert result == pytest.approx(1.0)
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")

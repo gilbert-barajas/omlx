@@ -42,6 +42,9 @@ OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
 _OQ_DEFAULT_GROUP_SIZE = 64
 
+_GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
+_GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
+
 _MAX_MODEL_RAM_FRACTION = 0.8
 
 # Auto-built proxy for sensitivity measurement when the source model
@@ -92,6 +95,8 @@ _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
 _ROUTED_LAYER_BOOST_LEVELS = {2.5, 2.7}
 _VALID_QUANT_BITS = (2, 3, 4, 5, 6, 8)
 
+_NATIVE_FLOAT8_QUANT_METHODS = frozenset(("fp8", "mxfp8"))
+
 
 def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
     """Return (target_bpw, hard_cap_bpw) for the given oQ level, or None."""
@@ -117,6 +122,17 @@ def _validate_oq_dtype_for_model(config: dict, dtype: str) -> None:
             "DeepSeek V4 fp16 oQ can collapse to repeated BOS tokens during "
             "generation; use dtype='bfloat16' instead."
         )
+
+
+def _uses_quantized_source_sensitivity(config: dict) -> bool:
+    """Return whether source sensitivity must perturb quantized modules."""
+    quantization_config = config.get("quantization_config") or {}
+    if not isinstance(quantization_config, dict):
+        return False
+    quant_method = str(quantization_config.get("quant_method", "")).lower()
+    if quant_method == "mxfp8":
+        return True
+    return quant_method == "fp8" and _is_deepseek_v4_config(config)
 
 
 @dataclass
@@ -145,6 +161,25 @@ class OQImatrixData:
     metadata: dict[str, Any]
     path: str
     reused: bool = False
+
+
+def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
+    """Return the mandatory Q8 spec for GLM DSA indexer projections.
+
+    The GLM sparse-attention indexer decides which tokens survive top-k
+    selection. Its three projections are tiny relative to the full MoE model,
+    so spending mixed-precision budget below Q8 buys negligible size savings
+    while making the saved checkpoint incompatible with the fused Q8 loader.
+    Keep backbone and preserved-MTP indexers on the same explicit format.
+    """
+    if config.get("model_type") != "glm_moe_dsa":
+        return None
+    path = _normalize_quant_path(path)
+    if ".self_attn.indexer." not in path:
+        return None
+    if not path.endswith(tuple(f".{name}" for name in _GLM_INDEXER_PROJECTIONS)):
+        return None
+    return dict(_GLM_INDEXER_Q8)
 
 
 def universal_quant_predicate(
@@ -181,6 +216,10 @@ def universal_quant_predicate(
     non_quantizable = config.get("_oq_non_quantizable", set())
     if path in non_quantizable:
         return False
+
+    glm_indexer_override = _glm_indexer_q8_override(path, config)
+    if glm_indexer_override is not None:
+        return glm_indexer_override
 
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
@@ -368,6 +407,11 @@ def _is_vision_tensor(name: str) -> bool:
         for p in (
             "visual.",
             "vision_",
+            # DeepSeek-OCR / Unlimited-OCR SAM encoder. Kept full precision like
+            # the rest of the vision tower: its neck/net_2/net_3 are nn.Conv2d,
+            # which mlx cannot quantize at all, so quantizing them yields
+            # unloadable .scales/.biases the model has no slot for.
+            "sam_model",
             "patch_embed",
             "pos_embed",
             "image_newline",
@@ -684,6 +728,16 @@ def _build_quant_plan(
     boost_map: dict[str, dict] = {}
     fixed_overrides = fixed_overrides or {}
 
+    # GLM DSA indexers are a format invariant, not an optional sensitivity
+    # boost. Seed them before pricing the plan and never let the bpw cap drop
+    # them. On GLM-5.2 all 22 indexers together are only about 209 MiB at Q8.
+    for path in named_shapes:
+        if path in fixed_overrides:
+            continue
+        override = _glm_indexer_q8_override(path, config)
+        if override is not None:
+            boost_map[path] = override
+
     layer_scores = config.get("_oq_sensitivity_map") or {}
     max_layer_score = max(layer_scores.values(), default=0.0)
 
@@ -702,7 +756,7 @@ def _build_quant_plan(
         base_bits,
         base_group_size,
         base_mode,
-        overrides=fixed_overrides,
+        overrides={**fixed_overrides, **boost_map},
     )
     total_bits_f = current_bpw * total_params
 
@@ -818,8 +872,16 @@ def _build_quant_plan(
             continue
         layer_idx = _extract_layer_index(path)
         if layer_idx < 0:
-            continue
-        layer_score = float(layer_scores.get(str(layer_idx), 0.0))
+            # MTP-head tensors carry no ``layers.<n>`` index but should
+            # compete like any other non-expert tensor (the stated contract
+            # is backbone-equal treatment for the head's internal block);
+            # score 0 seeds them at the bottom tier and the under-target
+            # fallback lifts them with the rest.
+            if not _is_mtp_tensor(path):
+                continue
+            layer_score = 0.0
+        else:
+            layer_score = float(layer_scores.get(str(layer_idx), 0.0))
         # Current bits (floor or base)
         cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
         cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
@@ -1359,7 +1421,17 @@ _FP8_WEIGHT_DTYPES = frozenset(("F8_E4M3", "F8_E5M2", "I8"))
 
 def _block_dequant_fp8(weight_raw, scale_raw, w_dtype, s_dtype):
     """Block-scaled dequant of a single FP8/I8 weight+scale pair to BF16."""
-    if s_dtype == "F8_E8M0":
+    # MXFP8 checkpoints (e.g. MiniMax-M3) save the e8m0 shared exponents
+    # with safetensors dtype U8: fp8 weight, one scale byte per 32 columns.
+    # Those bytes are exponents, not linear scales. Float-typed scales
+    # (DeepSeek block-128 weight_scale_inv) stay linear.
+    e8m0 = s_dtype == "F8_E8M0" or (
+        s_dtype in ("U8", "UINT8")
+        and w_dtype in ("F8_E4M3", "F8_E5M2")
+        and scale_raw.ndim == 2
+        and weight_raw.shape[-1] == scale_raw.shape[-1] * 32
+    )
+    if e8m0:
         scale = mx.power(mx.array(2.0), scale_raw.astype(mx.float32) - 127.0)
     else:
         scale = scale_raw
@@ -2082,8 +2154,9 @@ def validate_quantizable(config: dict) -> bool:
 
     Models with 'quantization' key (mlx-lm quantized) are excluded.
     Models with 'quantization_config' are excluded UNLESS they are native FP8
-    (e.g. MiniMax, DeepSeek) which are full-precision models stored in FP8 format,
-    or QAT-trained models (e.g. Google Gemma 4 QAT variants) whose
+    or MXFP8 (e.g. MiniMax, DeepSeek) source models whose floating-point
+    weights can be reconstructed from their block scales, or QAT-trained models
+    (e.g. Google Gemma 4 QAT variants) whose
     quantization_config records training-time settings but whose weights are
     stored in full precision (bfloat16/float16).
     """
@@ -2092,10 +2165,20 @@ def validate_quantizable(config: dict) -> bool:
     if "quantization_config" in config:
         qc = config["quantization_config"]
         if isinstance(qc, dict):
-            quant_method = qc.get("quant_method", "")
-            # FP8 models are full-precision weights stored in FP8 format
-            if quant_method == "fp8":
+            quant_method = str(qc.get("quant_method", "")).lower()
+            # Native FP8/MXFP8 sources retain floating-point weight semantics.
+            # _LazyTensorIndex reconstructs them from weight+scale pairs before
+            # applying the requested oQ/oQe format.
+            if quant_method in _NATIVE_FLOAT8_QUANT_METHODS:
                 return True
+            # compressed-tensors float-quantized (e.g. Laguna FP8) is the same
+            # situation with a different container: fp8 weights + block scales
+            # that the lazy index dequantizes on the fly.
+            if quant_method == "compressed-tensors":
+                group = qc.get("config_groups", {}).get("group_0", {})
+                fmt = qc.get("format") or group.get("format")
+                if fmt == "float-quantized":
+                    return True
             # QAT models record training-time quant_type but weights are fp16/bf16
             if _is_qat_unquantized_config(qc):
                 return True
@@ -2488,6 +2571,28 @@ def _is_mtp_tensor(name: str) -> bool:
     return name.startswith("mtp.") or ".mtp." in name
 
 
+def _source_has_nextn_tensors(keys, config: dict) -> bool:
+    """True iff the checkpoint stores its MTP head as extra decoder layers.
+
+    DeepSeek-V3-style checkpoints (GLM-5.2 among them) keep the MTP layers
+    as ``model.layers.<num_hidden_layers + i>.*`` rather than ``mtp.*``;
+    the model patch's sanitize remaps them, so for preservation purposes
+    they count as MTP tensors even though ``_is_mtp_tensor`` (which sees
+    post-sanitize names) doesn't match them.
+    """
+    cfgs = (config, config.get("text_config") or {})
+    n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
+    if n_mtp <= 0:
+        return False
+    n_main = 0
+    for c in cfgs:
+        n_main = max(n_main, int(c.get("num_hidden_layers", 0) or 0))
+    if n_main <= 0:
+        return False
+    prefixes = tuple(f"model.layers.{n_main + i}." for i in range(n_mtp))
+    return any(k.startswith(prefixes) for k in keys)
+
+
 def _normalize_mtp_in_config(config: dict) -> None:
     """Zero out MTP layer counts in the output config (in place).
 
@@ -2557,9 +2662,16 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
         or None if the model class can't be loaded.
     """
     architectures = config.get("architectures", [])
+    # Detect VLMs by the canonical vision-subconfig predicate (used everywhere
+    # else in oq.py), not just the ForConditionalGeneration arch name. OCR VLMs
+    # like baidu/Unlimited-OCR (UnlimitedOCRForCausalLM) and DeepSeek-OCR
+    # (DeepseekOCR2ForCausalLM) carry a vision_config but a ForCausalLM arch, so
+    # the arch-only heuristic dropped them to the mlx-lm sanitize path (which
+    # can't resolve their model_type) and shipped unsanitized vision weights.
     is_vlm = (
-        any("ForConditionalGeneration" in a for a in architectures) and not text_only
-    )
+        any("ForConditionalGeneration" in a for a in architectures)
+        or _has_vision_subconfig(config)
+    ) and not text_only
 
     if is_vlm:
         try:
@@ -2655,7 +2767,16 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 _lm_proxy = type("_LMProxy", (), {})()
                 _lm_proxy.args = text_config
                 proxy.language_model = _lm_proxy
-                w = model_module.Model.sanitize(proxy, weights)
+                # Model.sanitize is an instance method (self, weights) for most
+                # VLMs, but a @staticmethod (weights) for the DeepSeek-OCR family
+                # (deepseekocr / unlimited_ocr). Dispatch on the arg count so the
+                # proxy is only passed when sanitize actually takes a self.
+                _san = model_module.Model.sanitize
+                _san_argc = getattr(getattr(_san, "__code__", None), "co_argcount", 2)
+                if _san_argc >= 2:
+                    w = _san(proxy, weights)
+                else:
+                    w = _san(weights)
 
                 w = sanitize_weights(model_module.VisionModel, w, vision_config)
                 w = sanitize_weights(model_module.LanguageModel, w, text_config)
@@ -2692,6 +2813,16 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 apply_deepseek_v4_patch()
             except Exception as patch_err:
                 logger.debug(f"deepseek_v4 base patch not applied: {patch_err}")
+
+        # Laguna is likewise vendored into ``sys.modules`` by its pre-load
+        # patch; register it so sanitizer/proxy builds resolve the class.
+        if config.get("model_type") == "laguna":
+            try:
+                from omlx.patches.laguna import apply_laguna_patch
+
+                apply_laguna_patch()
+            except Exception as patch_err:
+                logger.debug(f"laguna patch not applied: {patch_err}")
 
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
@@ -2815,18 +2946,18 @@ def _is_mtp_protected_tensor(name: str) -> bool:
     Qwen3.5-27B accepted 0/157 cycles). PR 990 protects ``mtp.fc`` for
     Qwen3.5/3.6; PR 15's DeepSeek-V4 ``MTPBlock`` exposes the same
     semantics under different names (``e_proj`` + ``h_proj`` for the
-    embedding/hidden fusion; ``hc_head.*`` for the final projection).
-    All of these stay in full precision; the MTP block's internal
-    DeepseekV4Block (attn/ffn) gets the same quantization as the
-    backbone's other layers.
+    embedding/hidden fusion; ``hc_head.*`` for the final projection);
+    GLM-5.2's ``GlmMTPBlock`` calls it ``eh_proj``. All of these stay in
+    full precision; the MTP block's internal decoder block (attn/ffn)
+    gets the same quantization as the backbone's other layers.
     """
     if not (name.startswith("mtp.") or ".mtp." in name):
         return False
     # Qwen3.5/3.6 fusion projection
     if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
         return True
-    # DeepSeek-V4 MTPBlock fusion projections
-    if name.endswith(".e_proj.weight") or name.endswith(".h_proj.weight"):
+    # DeepSeek-V4 / GLM-5.2 MTP block fusion projections
+    if name.endswith((".e_proj.weight", ".h_proj.weight", ".eh_proj.weight")):
         return True
     # DeepSeek-V4 HyperHead final projection (sanitized form has the dot;
     # the raw-HF form arrives as ``hc_head_<param>`` and we cover both).
@@ -2862,8 +2993,33 @@ def _get_predicate_bits(
         bits = result.get("bits", base_bits)
         gs = result.get("group_size", group_size)
         mode = result.get("mode", _mode_for_bits(bits))
+        if _is_mtp_tensor(tensor_name):
+            raised = _mtp_bits_override(bits)
+            if raised != bits:
+                # Floor lift re-derives mode and group size; unchanged bits
+                # keep the predicate's choice (e.g. mxfp8 head projections).
+                bits, mode = raised, _mode_for_bits(raised)
+                gs = _gs_for_mode(raised, group_size)
         return bits, gs, mode
-    return base_bits, _gs_for_mode(base_bits, group_size), _mode_for_bits(base_bits)
+    bits = base_bits
+    if _is_mtp_tensor(tensor_name):
+        bits = _mtp_bits_override(bits)
+    return bits, _gs_for_mode(bits, group_size), _mode_for_bits(bits)
+
+
+# Minimum bits for quantized MTP-head tensors. Sub-4-bit oQ levels drag the
+# head down with the trunk (DeepSeek-V4 oQ2.5e stored its head's routed
+# experts and attention at 2-bit gs64), but the head only shapes drafts —
+# every emitted token is trunk-verified — so its footprint (~2 GB on
+# DeepSeek-V4-Flash, ~15 MB on Qwen3.6) buys draft acceptance directly and
+# costs almost nothing relative to the model.
+_MTP_MIN_BITS = 4
+
+
+def _mtp_bits_override(bits: int) -> int:
+    if bits and bits < _MTP_MIN_BITS:
+        return _MTP_MIN_BITS
+    return bits
 
 
 def _mode_for_bits(bits: int) -> str:
@@ -2957,6 +3113,17 @@ class _LazyTensorIndex:
                     seen.add(wk)
             elif k.endswith(".scale"):
                 wk = k[: -len(".scale")] + ".weight"
+                if (
+                    wk in self._index
+                    and wk not in seen
+                    and self._index[wk][5] in _FP8_WEIGHT_DTYPES
+                ):
+                    self._fp8_pairs[wk] = k
+                    seen.add(wk)
+            elif k.endswith(".weight_scale"):
+                # compressed-tensors float-quantized (e.g. Laguna FP8):
+                # X.weight (F8_E4M3) + X.weight_scale (f32 block scales).
+                wk = k[: -len("_scale")]
                 if (
                     wk in self._index
                     and wk not in seen
@@ -3892,7 +4059,7 @@ def quantize_oq_streaming(
             faster prefill on M1/M2 Apple Silicon (native fp16 support), but
             is unsupported for DeepSeek V4.
         preserve_mtp: Keep mtp.* tensors and config fields in the output so
-            the Native MTP toggle works after quantization. Stashes mtp.*
+            the Lightning MTP toggle works after quantization. Stashes mtp.*
             keys around the model.sanitize() call (which would otherwise
             strip them) and re-merges. When False (default), mtp.* tensors
             are stripped *and* the output config's mtp_num_hidden_layers /
@@ -3968,7 +4135,11 @@ def quantize_oq_streaming(
     cb("loading", 8.0, "Indexing source weights")
 
     all_weights = _LazyTensorIndex(weight_files)
-    if preserve_mtp and not any(_is_mtp_tensor(k) for k in all_weights.keys()):
+    if (
+        preserve_mtp
+        and not any(_is_mtp_tensor(k) for k in all_weights.keys())
+        and not _source_has_nextn_tensors(all_weights.keys(), config)
+    ):
         logger.warning(
             "Preserve MTP requested for %s, but no mtp.* tensors were found "
             "in the checkpoint; disabling MTP preservation",
@@ -3994,6 +4165,42 @@ def quantize_oq_streaming(
             "OOM-prone paths will be skipped"
         )
 
+    # RAM-safe calibration proxy, shared between oQe imatrix collection and
+    # auto-proxy sensitivity so an exceeds-RAM run builds it at most once.
+    # Built lazily (an imatrix cache hit never pays for it) and deleted as
+    # soon as the last calibration pass is done.
+    _ram_safe_proxy_dir: Path | None = None
+
+    def _ensure_ram_safe_proxy() -> Path:
+        nonlocal _ram_safe_proxy_dir
+        if _ram_safe_proxy_dir is None:
+            logger.warning(
+                f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) "
+                f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
+                f"({_system_ram / 1e9:.1f} GB). Building a uniform "
+                f"{_PROXY_QUANT_BITS}-bit proxy on disk for the calibration "
+                "passes."
+            )
+            _ram_safe_proxy_dir = _build_proxy_for_sensitivity(
+                model_path,
+                config=config,
+                dtype=dtype,
+                working_dir=str(output.parent),
+                trust_remote_code=trust_remote_code,
+                preserve_mtp=preserve_mtp,
+            )
+        return _ram_safe_proxy_dir
+
+    def _cleanup_ram_safe_proxy() -> None:
+        nonlocal _ram_safe_proxy_dir
+        if _ram_safe_proxy_dir is not None and _ram_safe_proxy_dir.exists():
+            shutil.rmtree(_ram_safe_proxy_dir, ignore_errors=True)
+            logger.info(
+                f"oQ{oq_level:g}: cleaned up calibration proxy at "
+                f"{_ram_safe_proxy_dir}"
+            )
+        _ram_safe_proxy_dir = None
+
     cb("loading", 12.0, "Preparing quantization inputs")
 
     imatrix_data: OQImatrixData | None = None
@@ -4013,19 +4220,35 @@ def quantize_oq_streaming(
                 )
             )
         cb("imatrix", 13.0, "Preparing oQe imatrix calibration")
-        imatrix_data = _load_or_collect_imatrix(
-            model_path,
-            config,
-            cache_path=imatrix_cache_path,
-            reuse_cache=imatrix_reuse_cache,
-            num_samples=int(imatrix_num_samples),
-            seq_length=int(imatrix_seq_length),
-            strict=imatrix_strict,
-            trust_remote_code=trust_remote_code,
-            progress_callback=cb,
-            progress_start=13.0,
-            progress_end=18.0,
-        )
+
+        def _imatrix_load_path() -> str:
+            cb(
+                "imatrix",
+                13.0,
+                "Building RAM-safe proxy for imatrix calibration",
+            )
+            return str(_ensure_ram_safe_proxy())
+
+        try:
+            imatrix_data = _load_or_collect_imatrix(
+                model_path,
+                config,
+                cache_path=imatrix_cache_path,
+                reuse_cache=imatrix_reuse_cache,
+                num_samples=int(imatrix_num_samples),
+                seq_length=int(imatrix_seq_length),
+                strict=imatrix_strict,
+                trust_remote_code=trust_remote_code,
+                progress_callback=cb,
+                progress_start=13.0,
+                progress_end=18.0,
+                load_path_factory=(
+                    _imatrix_load_path if _model_exceeds_ram else None
+                ),
+            )
+        except BaseException:
+            _cleanup_ram_safe_proxy()
+            raise
         cb("imatrix", 18.0, "oQe imatrix calibration ready")
         imatrix_report = {
             "enabled": True,
@@ -4065,17 +4288,13 @@ def quantize_oq_streaming(
             )
         elif (
             not _model_exceeds_ram
-            and str(config.get("model_type", "")).startswith("deepseek_v4")
-            and isinstance(config.get("quantization_config"), dict)
-            and config["quantization_config"].get("quant_method") == "fp8"
+            and _uses_quantized_source_sensitivity(config)
         ):
-            # Native-fp8 source (e.g. DeepSeek-V4-Flash): the checkpoint
-            # loads as a quantized model (mxfp4 experts / mxfp8 attention),
-            # so the raw qdq measurement would only perturb the few float
-            # Linears. Measure on the source itself with the re-quantization
-            # perturbation instead.
+            # Native FP8/MXFP8 sources load as quantized modules. The raw QDQ
+            # measurement only perturbs float Linears, so measure on the source
+            # itself with the re-quantization perturbation instead.
             logger.info(
-                f"oQ{oq_level:g}: pre-quantized fp8 source, measuring "
+                f"oQ{oq_level:g}: pre-quantized FP8/MXFP8 source, measuring "
                 "sensitivity on source"
             )
             sensitivity_map = _measure_sensitivity_from_quantized_model(
@@ -4094,15 +4313,8 @@ def quantize_oq_streaming(
                 f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
                 "measurement stays data-driven."
             )
-            _proxy_dir: Path | None = None
             try:
-                _proxy_dir = _build_proxy_for_sensitivity(
-                    model_path,
-                    config=config,
-                    dtype=dtype,
-                    working_dir=str(output.parent),
-                    trust_remote_code=trust_remote_code,
-                )
+                _proxy_dir = _ensure_ram_safe_proxy()
                 logger.info(
                     f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, measuring sensitivity"
                 )
@@ -4122,9 +4334,7 @@ def quantize_oq_streaming(
                     "full-fp16 sensitivity measurement."
                 ) from e
             finally:
-                if _proxy_dir is not None and _proxy_dir.exists():
-                    shutil.rmtree(_proxy_dir, ignore_errors=True)
-                    logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
+                _cleanup_ram_safe_proxy()
         elif _model_exceeds_ram:
             raise RuntimeError(
                 f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% "
@@ -4151,12 +4361,18 @@ def quantize_oq_streaming(
     # error here so the rest of quantize_oq_streaming never runs without a
     # data-driven sensitivity map.
     if not sensitivity_map:
+        _cleanup_ram_safe_proxy()
         raise RuntimeError(
             f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
             "Check the preceding log lines for the root cause (model load, "
             "calibration data, or layer discovery), and either fix it or "
             "pass an explicit sensitivity_model_path."
         )
+
+    # Calibration passes are done — drop the RAM-safe proxy (built when the
+    # source exceeds system RAM; a cached sensitivity map plus an imatrix
+    # cache hit means it was never built at all).
+    _cleanup_ram_safe_proxy()
 
     cb(
         "loading",
@@ -4588,6 +4804,10 @@ def quantize_oq_streaming(
 
 _SENS_NUM_SAMPLES = 128
 _SENS_SEQ_LENGTH = 256
+# Calibration subsampling uses a fixed key so repeated quants of the same
+# source select the same samples (#2293). Keyed draws leave the global RNG
+# stream untouched.
+_CALIB_SAMPLE_SEED = 0
 _OQE_CALIB_DATASET = "oqe_code_multilingual"
 _OQE_IMATRIX_FORMAT = "omlx-oqe-imatrix-cache"
 _OQE_MAX_SAMPLE_MULTIPLIER = 8
@@ -4650,6 +4870,22 @@ def _load_calibration_data(
     Returns:
         MLX array of shape (num_samples, seq_length) or None on failure.
     """
+    if dataset == _OQE_CALIB_DATASET:
+        # oQe (enhanced=True) requests this built-in corpus by name. If the data
+        # file is not present in the installed package, the generic handler below
+        # would swallow the error and silently calibrate the imatrix on a smaller,
+        # different corpus, producing a subtly worse enhanced model with no signal
+        # to the caller. Fail loudly instead: a missing built-in data file is a
+        # broken installation the user cannot fix by retrying. See package-data in
+        # pyproject.toml, which must ship oqe_calibration_data.json.
+        oqe_path = Path(__file__).parent / "oqe_calibration_data.json"
+        if not oqe_path.exists():
+            raise FileNotFoundError(
+                f"oQe calibration corpus not found at {oqe_path}. This file ships "
+                "with omlx but is missing from the current installation, so "
+                "enhanced quantization cannot calibrate correctly. Reinstall omlx "
+                "from a distribution that includes oqe_calibration_data.json."
+            )
     if dataset in ("code_multilingual", "code", "multilingual", _OQE_CALIB_DATASET):
         try:
             return _load_builtin_calibration(
@@ -4744,7 +4980,9 @@ def _load_builtin_calibration(
     tokens = tokens[:usable].reshape(-1, seq_length)
 
     if num_samples > 0 and tokens.shape[0] > num_samples:
-        indices = mx.random.permutation(tokens.shape[0])[:num_samples]
+        indices = mx.random.permutation(
+            tokens.shape[0], key=mx.random.key(_CALIB_SAMPLE_SEED)
+        )[:num_samples]
         tokens = tokens[indices]
 
     logger.info(f"Calibration: {tokens.shape[0]} samples x {seq_length} tokens")
@@ -4840,7 +5078,9 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
 
     n_available = tokens.shape[0]
     if num_samples > 0 and n_available > num_samples:
-        indices = mx.random.permutation(n_available)[:num_samples]
+        indices = mx.random.permutation(
+            n_available, key=mx.random.key(_CALIB_SAMPLE_SEED)
+        )[:num_samples]
         tokens = tokens[indices]
 
     logger.info(
@@ -5095,11 +5335,22 @@ class OQImatrixCollector:
         cls = type(module).__name__
         if cls in _OQE_SWITCH_LINEAR_CLASSES:
             return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
+        # QuantizedLinear capture lets imatrix collection run against
+        # already-quantized checkpoints (e.g. deriving a recalibrated MTP
+        # head from an oQ8 model when the bf16 source is gone).
         return (
-            cls == "Linear"
+            cls in ("Linear", "QuantizedLinear")
             and hasattr(module, "weight")
             and getattr(module.weight, "ndim", 0) == 2
         )
+
+    @staticmethod
+    def _module_in_dim(module) -> int:
+        w = module.weight
+        bits = getattr(module, "bits", None)
+        if bits and w.dtype == mx.uint32:
+            return int(w.shape[-1] * 32 // int(bits))
+        return int(w.shape[-1])
 
     def install(self, model) -> int:
         replacements = []
@@ -5138,7 +5389,7 @@ class OQImatrixCollector:
 
     def collect_dense(self, name: str, module, x) -> None:
         try:
-            in_dim = int(module.weight.shape[-1])
+            in_dim = self._module_in_dim(module)
             if getattr(x, "shape", ()) and int(x.shape[-1]) != in_dim:
                 return
             mx.eval(x)
@@ -5224,6 +5475,54 @@ class OQImatrixCollector:
             self._accumulate_switch(entry, idx_flat, x_source, n_experts, token_ids)
         except Exception as e:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
+
+
+def _collect_mtp_head_imatrix(model, batch, hidden) -> bool:
+    """Run the MTP head over a calibration micro-batch.
+
+    The trunk-layer walk never invokes the head, so without this pass every
+    ``mtp.*`` linear lands in the imatrix "missing" list and gets quantized
+    without calibration — measurably hurting draft acceptance. Mirrors the
+    decode-time contract: fuse the trunk's post-norm hidden at position t
+    with the embedding of token t+1 (the head's own input RMSNorms make the
+    residual pre/post-norm difference negligible for activation statistics).
+    """
+    inner = getattr(model, "language_model", None) or model
+    mtp = getattr(inner, "mtp", None)
+    if mtp is None:
+        return False
+    try:
+        if isinstance(mtp, (list, tuple)):
+            # DeepSeek-V4 style: MTPBlock stack consuming the raw (4D)
+            # trunk hidden; Model.mtp_forward wires mask/cache/embedding.
+            out = inner.mtp_forward(
+                hidden[:, :-1],
+                batch[:, 1:],
+                inner.make_mtp_cache(),
+            )
+            mx.eval(out)
+            return True
+        core = getattr(inner, "model", None) or inner
+        norm = getattr(core, "norm", None)
+        embed = getattr(core, "embed_tokens", None)
+        if norm is None or embed is None:
+            return False
+        # The head's attention reads cache.offset unconditionally on the
+        # mlx-vlm classes — give it a fresh cache per micro-batch.
+        make_cache = getattr(inner, "make_mtp_cache", None)
+        if callable(make_cache):
+            mtp_cache = make_cache()
+        else:
+            from mlx_lm.models.cache import KVCache
+
+            mtp_cache = [KVCache() for _ in mtp.layers]
+        h = norm(hidden[:, :-1, :])
+        out = mtp(h, batch[:, 1:], embed, mtp_cache)
+        mx.eval(out)
+        return True
+    except Exception as e:
+        logger.warning("oQe imatrix MTP head pass skipped: %s", e)
+        return False
 
 
 def _collect_imatrix_from_model(
@@ -5328,6 +5627,14 @@ def _collect_imatrix_from_model(
                         and position_ids.get("kind") == "glm_moe_dsa"
                     ):
                         position_ids["prev_topk_indices"] = aux or prev_aux
+                    mx.synchronize()
+                    mx.clear_cache()
+
+                # MTP-head pass: the layer walk above leaves ``inputs`` as
+                # the final-layer hidden states; feed them (post-norm) plus
+                # the shifted token ids through the head so its linears
+                # contribute imatrix entries too.
+                if _collect_mtp_head_imatrix(model, batch, inputs):
                     mx.synchronize()
                     mx.clear_cache()
 
@@ -5464,16 +5771,21 @@ def _collect_imatrix(
     maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
 
     restore_mtp_active = None
-    if is_vlm and _has_mtp_heads(config) and has_mtp_weights:
+    if _has_mtp_heads(config) and has_mtp_weights:
+        # Attach the MTP head on the temporary calibration model so the
+        # head-forward pass in _collect_imatrix_from_model can exercise its
+        # linears (they'd otherwise land in the imatrix "missing" list).
         try:
             from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
-            from omlx.patches.mlx_vlm_mtp import (
-                apply_mlx_vlm_mtp_patch,
-                apply_mlx_vlm_mtp_runtime_patch,
-            )
 
-            apply_mlx_vlm_mtp_patch()
-            apply_mlx_vlm_mtp_runtime_patch()
+            if is_vlm:
+                from omlx.patches.mlx_vlm_mtp import (
+                    apply_mlx_vlm_mtp_patch,
+                    apply_mlx_vlm_mtp_runtime_patch,
+                )
+
+                apply_mlx_vlm_mtp_patch()
+                apply_mlx_vlm_mtp_runtime_patch()
             prev_active = is_mtp_active()
             set_mtp_active(True)
 
@@ -5482,7 +5794,7 @@ def _collect_imatrix(
 
             restore_mtp_active = _restore_mtp_active
         except Exception as e:
-            logger.debug("mlx-vlm MTP runtime patch skipped for oQe imatrix: %s", e)
+            logger.debug("MTP runtime patch skipped for oQe imatrix: %s", e)
 
     try:
         if is_vlm:
@@ -5508,7 +5820,7 @@ def _collect_imatrix(
 
             tokenizer = load_tokenizer(Path(model_path))
         else:
-            from mlx_lm import load as lm_load
+            from omlx.utils.model_loading import lm_load_compat as lm_load
 
             model, tokenizer = lm_load(
                 model_path,
@@ -5541,6 +5853,22 @@ def _collect_imatrix(
         mx.clear_cache()
 
 
+def _oqe_cache_missing_mtp_entries(cache: OQImatrixData, config: dict) -> bool:
+    """True when the model declares MTP heads but the cache predates the
+    MTP-head collection pass (no ``mtp.*`` entries) — force a recollect so
+    the head gets calibrated quantization instead of landing in "missing"."""
+    try:
+        from omlx.utils.model_loading import _has_mtp_heads
+
+        if not _has_mtp_heads(config):
+            return False
+    except Exception:
+        return False
+    return not any(
+        ".mtp." in key or key.startswith("mtp.") for key in cache.entries
+    )
+
+
 def _load_or_collect_imatrix(
     model_path: str,
     config: dict,
@@ -5555,6 +5883,7 @@ def _load_or_collect_imatrix(
     progress_callback=None,
     progress_start: float = 13.0,
     progress_end: float = 18.0,
+    load_path_factory: Callable[[], str] | None = None,
 ) -> OQImatrixData:
     source = Path(model_path)
     path = Path(cache_path)
@@ -5568,7 +5897,13 @@ def _load_or_collect_imatrix(
     if reuse_cache and path.exists():
         cache = _load_oqe_imatrix(path)
         if _oqe_cache_matches(cache, expected):
-            if _oqe_cache_has_required_expert_coverage(cache):
+            if _oqe_cache_missing_mtp_entries(cache, config):
+                logger.info(
+                    "oQe imatrix: cache predates MTP-head collection "
+                    "(no mtp.* entries), recollecting %s",
+                    path,
+                )
+            elif _oqe_cache_has_required_expert_coverage(cache):
                 cache.reused = True
                 logger.info("oQe imatrix: using cache %s", path)
                 _emit_progress(
@@ -5593,8 +5928,16 @@ def _load_or_collect_imatrix(
         seq_length,
         calib_dataset,
     )
+    # ``load_path_factory`` swaps in an alternate checkpoint for the
+    # calibration forwards (a RAM-safe quantized proxy of the source when
+    # the source exceeds system RAM). Resolved only on a cache miss so a
+    # reusable cache never pays the proxy build. The cache signature stays
+    # keyed to the source checkpoint either way.
+    load_path = model_path
+    if load_path_factory is not None:
+        load_path = load_path_factory()
     entries, collection_metadata = _collect_imatrix(
-        model_path,
+        load_path,
         config,
         calib_dataset=calib_dataset,
         num_samples=num_samples,
@@ -5840,12 +6183,14 @@ def _build_proxy_for_sensitivity(
     dtype: str,
     working_dir: str | None = None,
     trust_remote_code: bool = False,
+    preserve_mtp: bool = False,
 ) -> Path:
-    """Build a temporary uniform 4-bit proxy for sensitivity measurement.
+    """Build a temporary uniform 4-bit proxy for calibration passes.
 
     Used when the source model exceeds available RAM and full-fp16
-    sensitivity measurement is not feasible. The proxy keeps oQ data-driven;
-    without it, quantize_oq_streaming aborts the run with a RuntimeError.
+    sensitivity measurement / oQe imatrix collection is not feasible. The
+    proxy keeps oQ data-driven; without it, quantize_oq_streaming aborts
+    the run with a RuntimeError.
 
     ``working_dir`` controls where the proxy is written. Defaults to the
     system temp dir when None, but callers should pass the parent of the
@@ -5853,6 +6198,9 @@ def _build_proxy_for_sensitivity(
     already provisioned for the quantized output. This avoids the trap of
     Linux ``/tmp`` being tmpfs (RAM-backed), which would defeat the whole
     point of the OOM-driven proxy.
+
+    ``preserve_mtp`` keeps the MTP head in the proxy so the imatrix head
+    pass can exercise its linears; sensitivity-only proxies leave it off.
 
     The caller is responsible for deleting the returned directory.
     """
@@ -5864,6 +6212,7 @@ def _build_proxy_for_sensitivity(
         proxy_dir,
         dtype=dtype,
         trust_remote_code=trust_remote_code,
+        preserve_mtp=preserve_mtp,
     )
     return proxy_dir
 
@@ -5874,6 +6223,7 @@ def _build_streaming_proxy_for_sensitivity(
     *,
     dtype: str,
     trust_remote_code: bool = False,
+    preserve_mtp: bool = False,
 ) -> None:
     """Build a loadable 4-bit sensitivity proxy without loading the source.
 
@@ -5980,7 +6330,7 @@ def _build_streaming_proxy_for_sensitivity(
                 w_mx = w_mx[:]
             shape = w_mx.shape
 
-            if _is_mtp_tensor(tensor_name):
+            if _is_mtp_tensor(tensor_name) and not preserve_mtp:
                 del w_mx
                 continue
 
@@ -6061,7 +6411,8 @@ def _build_streaming_proxy_for_sensitivity(
         "_oq_non_quantizable",
     ):
         output_config.pop(temp_key, None)
-    _normalize_mtp_in_config(output_config)
+    if not preserve_mtp:
+        _normalize_mtp_in_config(output_config)
     quant_info = dict(quantization_config)
     for key, val in per_layer_config.items():
         quant_info[key] = val

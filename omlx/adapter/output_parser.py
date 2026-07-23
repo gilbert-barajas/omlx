@@ -680,8 +680,16 @@ def detect_output_parser(
     model_name: str,
     tokenizer: Any,
     model_config: dict[str, Any] | None = None,
+    model_path: str | None = None,
 ) -> OutputParserFactory | None:
-    """Detect a protocol-specific output parser for the model, if needed."""
+    """Detect a protocol-specific output parser for the model, if needed.
+
+    ``model_name`` drives detection (string matching) and may be a display
+    id rather than a directory since #2178. Pass ``model_path`` when the
+    filesystem path is available so parser sessions can locate
+    tokenizer.json for their streaming detokenizers.
+    """
+    session_model_path = model_path or model_name
 
     if is_harmony_model(model_name, model_config):
         temp_parser = HarmonyStreamingParser(tokenizer)
@@ -689,7 +697,7 @@ def detect_output_parser(
             kind="harmony",
             create_session=lambda session_tokenizer: HarmonyOutputParserSession(
                 session_tokenizer,
-                model_path=model_name,
+                model_path=session_model_path,
             ),
             stop_token_ids=temp_parser.get_stop_token_ids(),
             thinking_end_text="<|end|>",
@@ -710,7 +718,7 @@ def detect_output_parser(
             kind="gemma4",
             create_session=lambda session_tokenizer: Gemma4OutputParserSession(
                 session_tokenizer,
-                model_path=model_name,
+                model_path=session_model_path,
             ),
             stop_token_ids=set(),
             thinking_end_text="<channel|>",
@@ -728,7 +736,7 @@ def detect_output_parser(
             kind="deepseek_v4",
             create_session=lambda session_tokenizer: DeepSeekV4OutputParserSession(
                 session_tokenizer,
-                model_path=model_name,
+                model_path=session_model_path,
             ),
             stop_token_ids=set(),
             protocol_marker_texts=(
@@ -750,7 +758,7 @@ def detect_output_parser(
             kind="cohere2_moe",
             create_session=lambda session_tokenizer: Cohere2MoeOutputParserSession(
                 session_tokenizer,
-                model_path=model_name,
+                model_path=session_model_path,
             ),
             stop_token_ids=set(),
             thinking_end_text="</think>",
@@ -766,7 +774,7 @@ def detect_output_parser(
             kind="minimax_m3",
             create_session=lambda session_tokenizer: MiniMaxM3OutputParserSession(
                 session_tokenizer,
-                model_path=model_name,
+                model_path=session_model_path,
             ),
             stop_token_ids=minimax_stop_ids,
             thinking_start_text=_MINIMAX_THINK_START,

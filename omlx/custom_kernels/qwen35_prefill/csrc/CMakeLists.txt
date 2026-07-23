@@ -104,6 +104,69 @@ if(MLX_BUILD_METAL)
 
   add_dependencies(omlx_qwen35_prefill_kernel_ops
                    omlx_qwen35_prefill_kernels_metallib)
+
+  # NAX (M5 tensor-unit) kernels live in a separate metallib compiled with
+  # -mmacosx-version-min=26.2: the MetalPerformancePrimitives tensor-ops API
+  # needs macOS SDK 26.2+, and keeping them out of the classic metallib
+  # preserves its deployment target. The C++ op only loads this library when
+  # the runtime reports NAX support and degrades to the classic kernels when
+  # the file is absent.
+  execute_process(
+    COMMAND xcrun -sdk macosx --show-sdk-version
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    OUTPUT_VARIABLE OMLX_MACOS_SDK_VERSION
+    ERROR_QUIET)
+  if(OMLX_MACOS_SDK_VERSION VERSION_GREATER_EQUAL 26.2)
+    set(OMLX_QWEN35_PREFILL_NAX_METAL_FLAGS
+        -x
+        metal
+        -Wall
+        -Wextra
+        -fno-fast-math
+        -Wno-c++17-extensions
+        -Wno-c++20-extensions
+        -mmacosx-version-min=26.2)
+    if(MLX_METAL_DEBUG)
+      set(OMLX_QWEN35_PREFILL_NAX_METAL_FLAGS
+          ${OMLX_QWEN35_PREFILL_NAX_METAL_FLAGS} -gline-tables-only
+          -frecord-sources)
+    endif()
+    set(OMLX_QWEN35_PREFILL_NAX_AIR
+        ${CMAKE_CURRENT_BINARY_DIR}/qwen35_qmm_nax.air)
+    add_custom_command(
+      OUTPUT ${OMLX_QWEN35_PREFILL_NAX_AIR}
+      COMMAND
+        xcrun -sdk macosx metal ${OMLX_QWEN35_PREFILL_NAX_METAL_FLAGS} -c
+        ${CMAKE_CURRENT_LIST_DIR}/qwen35_qmm_nax.metal
+        ${OMLX_QWEN35_PREFILL_METAL_INCLUDE_ARGS} -o
+        ${OMLX_QWEN35_PREFILL_NAX_AIR}
+      DEPENDS ${CMAKE_CURRENT_LIST_DIR}/qwen35_qmm_nax.metal
+              ${OMLX_QWEN35_PREFILL_METAL_HEADERS}
+      COMMENT "Building qwen35_qmm_nax.air"
+      VERBATIM)
+    set(OMLX_QWEN35_PREFILL_NAX_METALLIB
+        ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/omlx_qwen35_prefill_kernels_nax.metallib)
+    add_custom_command(
+      OUTPUT ${OMLX_QWEN35_PREFILL_NAX_METALLIB}
+      # The link step also needs the 26.2 floor: MACOSX_DEPLOYMENT_TARGET in
+      # the build environment otherwise pins the link to an older AIR version
+      # and air-lld silently drops the newer NAX object (empty metallib).
+      COMMAND xcrun -sdk macosx metal -mmacosx-version-min=26.2
+              ${OMLX_QWEN35_PREFILL_NAX_AIR} -o
+              ${OMLX_QWEN35_PREFILL_NAX_METALLIB}
+      DEPENDS ${OMLX_QWEN35_PREFILL_NAX_AIR}
+      COMMENT "Building omlx_qwen35_prefill_kernels_nax.metallib"
+      VERBATIM)
+    add_custom_target(omlx_qwen35_prefill_kernels_nax_metallib
+                      DEPENDS ${OMLX_QWEN35_PREFILL_NAX_METALLIB})
+    add_dependencies(omlx_qwen35_prefill_kernel_ops
+                     omlx_qwen35_prefill_kernels_nax_metallib)
+  else()
+    message(
+      STATUS
+        "omlx: macOS SDK ${OMLX_MACOS_SDK_VERSION} < 26.2, skipping qwen35 NAX kernels"
+    )
+  endif()
 endif()
 
 nanobind_add_module(
@@ -118,5 +181,11 @@ nanobind_add_module(
 target_link_libraries(_ext PRIVATE omlx_qwen35_prefill_kernel_ops)
 
 if(BUILD_SHARED_LIBS)
-  target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
+  # @loader_path resolves the sibling kernel_ops dylib. The second entry
+  # resolves the mlx wheel's libmlx.dylib from the installed site-packages
+  # layout (omlx/custom_kernels/<pkg> -> site-packages -> mlx/lib); without
+  # it the only libmlx rpath is the link-time absolute path into the build
+  # env, which is dead after install (issue #2233).
+  target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path
+                      -Wl,-rpath,@loader_path/../../../mlx/lib)
 endif()

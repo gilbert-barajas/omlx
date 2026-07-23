@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _LINEAR_PATCHED = False
 _LM_LINEAR_PATCHED = False
-_SUPPORTED_QMM_BITS = frozenset((4, 5, 6, 8))
+_SUPPORTED_QMM_BITS = frozenset((2, 4, 5, 6, 8))
 _Q8_MIN_TOKENS = 16384
 
 
@@ -37,6 +37,14 @@ def _native_qmm_for_bits(bits: int) -> Callable[..., mx.array] | None:
     if bits not in _SUPPORTED_QMM_BITS or not fast.has_symbol(name):
         return None
     return getattr(fast, name)
+
+
+def _qmm_supports_group_size(group_size: int) -> bool:
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+    except Exception:
+        return False
+    return fast.qmm_supports_group_size(group_size)
 
 
 def _has_native_qmm() -> bool:
@@ -56,7 +64,10 @@ def _is_supported_affine_linear_shape(
         return False
     if ndim < 2 or seq_len <= 1:
         return False
-    if getattr(linear, "group_size", None) != 64:
+    group_size = getattr(linear, "group_size", None)
+    if group_size not in (64, 128):
+        return False
+    if not _qmm_supports_group_size(int(group_size)):
         return False
     bits = getattr(linear, "bits", None)
     if bits not in _SUPPORTED_QMM_BITS or getattr(linear, "mode", None) != "affine":
@@ -84,7 +95,7 @@ def _is_supported_affine_linear_shape(
         return False
     if scales.shape != biases.shape:
         return False
-    return scales.shape[0] == weight.shape[0] and scales.shape[1] == input_dim // 64
+    return scales.shape[0] == weight.shape[0] and scales.shape[1] == input_dim // group_size
 
 
 def _is_supported_affine_linear(linear: Any, x: mx.array) -> bool:
@@ -150,7 +161,8 @@ def _linear_qmm(linear: nn.QuantizedLinear, x: mx.array, variant: int) -> mx.arr
         return linear(x)
     if not _is_supported_affine_linear(linear, x):
         return linear(x)
-    return qmm(x, linear.weight, linear.scales, linear.biases, variant)
+    gs = int(getattr(linear, "group_size", 64))
+    return qmm(x, linear.weight, linear.scales, linear.biases, variant, gs)
 
 
 def _make_patched_mlp(
@@ -160,12 +172,16 @@ def _make_patched_mlp(
     q8_min_tokens: int,
 ):
     def patched(self, x, *args, **kwargs):
+        # Decode / short-sequence fast path first: this wrapper runs on every
+        # MLP call of every layer of every decode step, so the common case
+        # must exit on a single shape check (issue #2132 — per-call gate
+        # overhead across the qwen35 prefill patches costs ~2% TG).
+        if x.ndim < 3 or x.shape[-2] < min_tokens:
+            return orig_call(self, x, *args, **kwargs)
         target_verify = bool(kwargs.get("target_verify", False))
         if args and isinstance(args[0], bool):
             target_verify = target_verify or bool(args[0])
         if target_verify or os.environ.get("OMLX_QWEN35_Q4_MLP", "1") == "0":
-            return orig_call(self, x, *args, **kwargs)
-        if x.ndim < 3:
             return orig_call(self, x, *args, **kwargs)
         gate_proj = getattr(self, "gate_proj", None)
         up_proj = getattr(self, "up_proj", None)
@@ -292,11 +308,13 @@ def apply_qwen35_q4_prefill_linear_patch() -> bool:
     )
 
     def should_route(linear: Any, x: mx.array, target_verify: bool) -> bool:
+        # Shape gates first, env kill-switch last: the runtime toggle only
+        # matters on the (rare) routed side, while decode pays this per call.
         return (
             not target_verify
-            and os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") != "0"
             and x.ndim == 3
             and _can_route_affine_linear(linear, x, min_tokens, q8_min_tokens)
+            and os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") != "0"
         )
 
     def patched_linear(linear, x: mx.array, target_verify: bool):
@@ -306,10 +324,10 @@ def apply_qwen35_q4_prefill_linear_patch() -> bool:
 
     def patched_linears(linears, x: mx.array, target_verify: bool):
         if (
-            target_verify
-            or os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") == "0"
-            or x.ndim != 3
+            x.ndim != 3
             or x.shape[-2] < min_tokens
+            or target_verify
+            or os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") == "0"
         ):
             return orig_linears(linears, x, target_verify)
 
@@ -365,10 +383,11 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
     )
 
     def should_route(linear: Any, x: mx.array) -> bool:
+        # Shape gates first, env kill-switch last (decode pays this per call).
         return (
-            os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") != "0"
-            and x.ndim == 3
+            x.ndim == 3
             and _can_route_affine_linear(linear, x, min_tokens, q8_min_tokens)
+            and os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") != "0"
         )
 
     def qmm_or_linear(linear: Any, x: mx.array) -> mx.array:
@@ -455,13 +474,21 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
         except Exception:
             gated_delta_update = getattr(module, "gated_delta_update", None)
 
-        def patched_gdn(self, inputs, mask=None, cache=None):
+        def patched_gdn(self, inputs, mask=None, cache=None, n_confirmed: int = 0):
+            # n_confirmed is the Native-MTP draft/verify split (patches/mlx_lm_mtp).
+            # Verify forwards are always far below min_tokens, so this wrapper
+            # never routes them; forward the kwarg to the underlying (MTP-patched)
+            # __call__ only when set, so stock GatedDeltaNet stays compatible.
             if (
                 gated_delta_update is None
                 or inputs.ndim != 3
                 or inputs.shape[-2] < min_tokens
                 or self.sharding_group is not None
             ):
+                if n_confirmed:
+                    return orig_gdn(
+                        self, inputs, mask=mask, cache=cache, n_confirmed=n_confirmed
+                    )
                 return orig_gdn(self, inputs, mask=mask, cache=cache)
 
             input_linears = (
@@ -471,6 +498,10 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 self.in_proj_a,
             )
             if not any(should_route(linear, inputs) for linear in input_linears):
+                if n_confirmed:
+                    return orig_gdn(
+                        self, inputs, mask=mask, cache=cache, n_confirmed=n_confirmed
+                    )
                 return orig_gdn(self, inputs, mask=mask, cache=cache)
 
             B, S, _ = inputs.shape

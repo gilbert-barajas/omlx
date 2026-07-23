@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+import os
 from functools import lru_cache
 
 import mlx.core as mx
@@ -13,12 +14,34 @@ import mlx.nn as nn
 
 from mlx_lm.models.activations import swiglu
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+from omlx.custom_kernels.nax import is_nax_available
 
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
 _DEEPSEEK_MXFP4_LARGE_BLOCK_BM = 32
 _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT = 2
 _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = 8192
+
+# On NAX GPUs (M5 family) mx.gather_qmm dispatches to the tensor-unit
+# gather_qmm_rhs_nax kernels, which beat the pre-NAX block-list kernels for
+# prefill-sized route counts (same regression shape as the Qwen qmm patch:
+# 4k pp 828 -> 400 tok/s on M5 Max). Decode-sized calls stay on the block
+# kernels pending M5 measurements. OMLX_DEEPSEEK_MOE_NAX=0 keeps the block
+# kernels everywhere, =1 routes every call to stock on NAX GPUs.
+_NAX_STOCK_MODE = os.environ.get("OMLX_DEEPSEEK_MOE_NAX", "").strip().lower()
+_NAX_STOCK_MIN_ROUTES = int(
+    os.environ.get("OMLX_DEEPSEEK_MOE_NAX_MIN_ROUTES", "1024")
+)
+
+
+def _nax_prefers_stock(num_routes: int) -> bool:
+    if _NAX_STOCK_MODE in ("0", "false", "off"):
+        return False
+    if not is_nax_available():
+        return False
+    if _NAX_STOCK_MODE in ("1", "true", "on"):
+        return True
+    return num_routes >= _NAX_STOCK_MIN_ROUTES
 
 
 def _gather_sort(x, indices):
@@ -221,6 +244,8 @@ class QuantizedSwitchLinear(nn.Module):
         )
 
     def _native_block_kind(self, x, sorted_indices: bool, dtype=None) -> str | None:
+        if x.ndim == 3 and _nax_prefers_stock(int(x.shape[0])):
+            return None
         if self._can_use_mxfp4_blocks(x, sorted_indices):
             return "mxfp4"
         if self._can_use_affine_blocks(x, sorted_indices, dtype=dtype):

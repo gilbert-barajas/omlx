@@ -40,16 +40,18 @@ def _target_verify_arg(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
 
 
 def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) -> bool:
+    # Shape gates first: this runs on every MoE block call of every decode
+    # step, so the common (decode) case must exit on the seq-len check
+    # before touching env vars or Metal state (issue #2132).
+    if x.ndim != 3 or x.shape[-2] < min_tokens:
+        return False
     if target_verify:
+        return False
+    if x.dtype not in (mx.float16, mx.bfloat16):
         return False
     if os.environ.get("OMLX_QWEN35_MOE_WEIGHTED_SUM", "1") == "0":
         return False
     if not mx.metal.is_available():
-        return False
-    if x.ndim != 3 or x.shape[-2] < min_tokens or x.dtype not in (
-        mx.float16,
-        mx.bfloat16,
-    ):
         return False
     if getattr(self, "sharding_group", None) is not None:
         return False
@@ -58,11 +60,12 @@ def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) 
     if x.shape[-2] * int(getattr(self, "top_k", 0)) < 64:
         return False
     switch_mlp = getattr(self, "switch_mlp", None)
-    return (
-        switch_mlp is not None
-        and hasattr(switch_mlp, "up_proj")
-        and hasattr(switch_mlp, "gate_proj")
-        and hasattr(switch_mlp, "down_proj")
+    if switch_mlp is None or not hasattr(switch_mlp, "down_proj"):
+        return False
+    # Either the stock split projections or the omlx gate+up fused layout
+    # (qwen35_moe_gate_up patch, issue #2238).
+    return hasattr(switch_mlp, "gate_up_proj") or (
+        hasattr(switch_mlp, "up_proj") and hasattr(switch_mlp, "gate_proj")
     )
 
 
@@ -79,8 +82,13 @@ def _native_switch_weighted_sum(
     if switch_mlp.training:
         idx = mx.stop_gradient(idx)
 
-    x_up = switch_mlp.up_proj(x_sorted, idx, sorted_indices=True)
-    x_gate = switch_mlp.gate_proj(x_sorted, idx, sorted_indices=True)
+    gate_up = getattr(switch_mlp, "gate_up_proj", None)
+    if gate_up is not None:
+        x_gate_up = gate_up(x_sorted, idx, sorted_indices=True)
+        x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+    else:
+        x_up = switch_mlp.up_proj(x_sorted, idx, sorted_indices=True)
+        x_gate = switch_mlp.gate_proj(x_sorted, idx, sorted_indices=True)
     x_sorted = switch_mlp.down_proj(
         switch_mlp.activation(x_up, x_gate),
         idx,
@@ -126,6 +134,9 @@ def _fast_moe(self: Any, x: mx.array, target_verify: bool) -> mx.array:
 
 def _make_patched_call(orig_call: Callable[..., mx.array], min_tokens: int):
     def patched(self, x: mx.array, *args, **kwargs):
+        # Decode fast path: one shape check before any argument parsing.
+        if x.ndim != 3 or x.shape[-2] < min_tokens:
+            return orig_call(self, x, *args, **kwargs)
         target_verify = _target_verify_arg(args, kwargs)
         if not _should_route(self, x, target_verify, min_tokens):
             return orig_call(self, x, *args, **kwargs)

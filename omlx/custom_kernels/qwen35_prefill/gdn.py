@@ -530,9 +530,16 @@ _SUPPORTED_BLOCK_T = (16, 32, 48)
 _kernel_s_by_tb = {}
 
 
-def _normalize_block_t(block_t: int | str | None) -> int:
+def _normalize_block_t(block_t: int | str | None, input_dtype=None) -> int:
     if block_t is None:
-        block_t = os.environ.get("OMLX_GDN_BLOCK_T", "32")
+        configured_block_t = os.environ.get("OMLX_GDN_BLOCK_T")
+        if configured_block_t is not None:
+            block_t = configured_block_t
+        else:
+            # Qwen3.6 GDN inputs use float32 (mamba_ssm_dtype). TB=32 needs
+            # 40,192 bytes for the 128/128, 16/32 layout, exceeding Metal's
+            # 32 KiB threadgroup-memory limit. TB=16 needs 20,096 bytes.
+            block_t = 16 if input_dtype == mx.float32 else 32
     block_t = int(block_t)
     if block_t not in _SUPPORTED_BLOCK_T:
         raise ValueError(
@@ -541,8 +548,8 @@ def _normalize_block_t(block_t: int | str | None) -> int:
     return block_t
 
 
-def _get_kernel_s(block_t: int | str | None = None):
-    block_t = _normalize_block_t(block_t)
+def _get_kernel_s(block_t: int | str | None = None, input_dtype=None):
+    block_t = _normalize_block_t(block_t, input_dtype)
     kernel = _kernel_s_by_tb.get(block_t)
     if kernel is None:
         source = _KERNEL_S_SRC.replace(
@@ -580,7 +587,7 @@ def gated_delta_blocked_seq(
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
     g = g.astype(mx.float32)
     beta = beta.astype(mx.float32)
-    ks = _get_kernel_s(block_t)
+    ks = _get_kernel_s(block_t, in_dtype)
     y, state_out = ks(
         inputs=[q, k, v, g, beta, state, T],
         template=[("InT", in_dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],

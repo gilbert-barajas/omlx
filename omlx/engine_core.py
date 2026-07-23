@@ -495,7 +495,9 @@ class EngineCore:
 
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 # Fail all requests and remove from scheduler to prevent
-                # infinite loop (has_requests() must return False).
+                # infinite loop (has_requests() must go False; a pending
+                # idle reclaim may hold it True for one extra step, which
+                # drains and clears it).
                 failed_ids = await loop.run_in_executor(
                     self._mlx_executor, self.scheduler.fail_all_requests
                 )
@@ -680,27 +682,44 @@ class EngineCore:
 
         request_ids = list(self._output_collectors.keys())
         ceiling = 0
+        watermark = 0
         sched = self.scheduler
         if sched is not None:
             ceiling = int(getattr(sched, "_memory_hard_limit_bytes", 0) or 0)
+            watermark = int(getattr(sched, "_memory_hard_watermark_bytes", 0) or 0)
         usage = get_phys_footprint()
         usage_gb = usage / (1024**3)
         ceiling_gb = ceiling / (1024**3) if ceiling > 0 else 0.0
+        watermark_gb = watermark / (1024**3) if watermark > 0 else 0.0
+        advice = (
+            "Reduce context length, free system memory, or loosen "
+            "memory_guard_tier (safe → balanced → aggressive)."
+        )
         for rid in request_ids:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
-                if ceiling > 0:
+                # Name the watermark that actually tripped; printing only the
+                # ceiling reads as "usage below limit yet aborted" (#2321).
+                if watermark > 0 and ceiling > 0:
+                    error_msg = (
+                        f"Request aborted: process memory limit exceeded "
+                        f"(usage {usage_gb:.1f} GB, abort threshold "
+                        f"(hard watermark) {watermark_gb:.1f} GB, "
+                        f"ceiling {ceiling_gb:.1f} GB). "
+                        f"{advice}"
+                    )
+                elif ceiling > 0:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
                         f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                        "Reduce context size or lower memory_guard_tier."
+                        f"{advice}"
                     )
                 else:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
                         f"(usage {usage_gb:.1f} GB). "
-                        "Reduce context size or lower memory_guard_tier."
+                        f"{advice}"
                     )
                 collector.put(
                     RequestOutput(
@@ -902,10 +921,13 @@ class EngineCore:
 
         # Drain all outputs and get the last one (using the captured reference)
         final_output = None
+        first_token_at = None
         while True:
             output = collector.get_nowait()
             if output is None:
                 break
+            if first_token_at is None and output.generated_at is not None:
+                first_token_at = output.generated_at
             final_output = output
 
         # Cleanup
@@ -917,6 +939,7 @@ class EngineCore:
         if final_output.error:
             _raise_request_output_error(final_output)
 
+        final_output.first_token_at = first_token_at
         return final_output
 
     def generate_batch_sync(

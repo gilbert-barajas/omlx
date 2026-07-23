@@ -155,6 +155,18 @@ def test_prefill_patch_chunked_impl_opt_in(monkeypatch):
     assert calls == ["chunked"]
 
 
+def test_blocked_seq_default_block_size_depends_on_input_dtype(monkeypatch):
+    from omlx.custom_kernels.qwen35_prefill.gdn import _normalize_block_t
+
+    assert _normalize_block_t(None, mx.float32) == 16
+    assert _normalize_block_t(None, mx.bfloat16) == 32
+    assert _normalize_block_t(None, mx.float16) == 32
+
+    monkeypatch.setenv("OMLX_GDN_BLOCK_T", "48")
+    assert _normalize_block_t(None, mx.float32) == 48
+    assert _normalize_block_t(32, mx.float32) == 32
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
 def test_blocked_seq_matches_stock_kernel_small():
     from mlx_lm.models.gated_delta import gated_delta_kernel
@@ -181,3 +193,43 @@ def test_blocked_seq_matches_stock_kernel_small():
     ).item()
     assert y_err < 2e-2
     assert s_rel < 1e-5
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
+def test_blocked_seq_float32_default_fits_threadgroup_memory():
+    from mlx_lm.models.gated_delta import gated_delta_kernel
+
+    from omlx.custom_kernels.qwen35_prefill import gated_delta_blocked_seq
+
+    # Exact GDN layout from issue #2162. With float32 inputs, TB=32 requires
+    # 40,192 bytes of threadgroup memory and cannot load on a 32 KiB device.
+    B, T, Hk, Hv, Dk, Dv = 1, 64, 16, 32, 128, 128
+    keys = [mx.random.key(i) for i in range(6)]
+    q = (mx.random.normal((B, T, Hk, Dk), key=keys[0]) * Dk**-1.0).astype(
+        mx.float32
+    )
+    k = (mx.random.normal((B, T, Hk, Dk), key=keys[1]) * Dk**-0.5).astype(
+        mx.float32
+    )
+    v = mx.random.normal((B, T, Hv, Dv), key=keys[2]).astype(mx.float32)
+    g = mx.exp(-mx.random.uniform(0.01, 3.0, (B, T, Hv), key=keys[3])).astype(
+        mx.float32
+    )
+    beta = mx.sigmoid(mx.random.normal((B, T, Hv), key=keys[4])).astype(
+        mx.float32
+    )
+    state = (mx.random.normal((B, Hv, Dv, Dk), key=keys[5]) * 0.1).astype(
+        mx.float32
+    )
+    mx.eval(q, k, v, g, beta, state)
+
+    y_ref, s_ref = gated_delta_kernel(q, k, v, g, beta, state)
+    y_fast, s_fast = gated_delta_blocked_seq(q, k, v, g, beta, state)
+    mx.eval(y_ref, s_ref, y_fast, s_fast)
+
+    y_err = mx.max(mx.abs(y_fast - y_ref)).item()
+    s_rel = (
+        mx.max(mx.abs(s_fast - s_ref)) / (mx.max(mx.abs(s_ref)) + 1e-9)
+    ).item()
+    assert y_err < 1e-6
+    assert s_rel < 1e-6

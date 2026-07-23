@@ -46,6 +46,7 @@ from omlx.oq import (
     _is_moe_router,
     _is_vision_tensor,
     _LazyTensorIndex,
+    _load_builtin_calibration,
     _measure_sensitivity,
     _measure_sensitivity_from_quantized_model,
     _normalize_quant_path,
@@ -243,6 +244,36 @@ class TestUniversalQuantPredicate:
         )
         assert isinstance(result, dict)
         assert result["bits"] == 6
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "model.layers.0.self_attn.indexer.wq_b",
+            "model.layers.0.self_attn.indexer.wk.weight",
+            "model.layers.0.self_attn.indexer.weights_proj",
+            "mtp.0.block.self_attn.indexer.wq_b.weight",
+            "mtp.0.block.self_attn.indexer.wk",
+            "mtp.0.block.self_attn.indexer.weights_proj.weight",
+        ],
+    )
+    def test_glm_dsa_indexer_is_mandatory_q8(self, path, module):
+        config = {
+            "model_type": "glm_moe_dsa",
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {path.removesuffix(".weight"): {"bits": 5}},
+        }
+        result = universal_quant_predicate(path, module, config, 3.5)
+        assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
+
+    @pytest.mark.parametrize("model_type", ["deepseek_v32", "deepseek_v4"])
+    def test_glm_dsa_indexer_q8_rule_does_not_touch_deepseek(self, model_type, module):
+        result = universal_quant_predicate(
+            "model.layers.0.self_attn.indexer.wq_b",
+            module,
+            {"model_type": model_type},
+            3.5,
+        )
+        assert result is True
 
     def test_dense_o_proj_5bit(self, dense_config, module):
         result = universal_quant_predicate(
@@ -765,6 +796,70 @@ class TestValidateQuantizable:
             is True
         )
 
+    def test_mxfp8_native_is_quantizable(self):
+        # MiniMax M3 publishes reconstructable FP8 weights under this method.
+        assert (
+            validate_quantizable({"quantization_config": {"quant_method": "mxfp8"}})
+            is True
+        )
+
+    def test_quantized_sensitivity_routing_preserves_glm_fp8_dequant(self):
+        from omlx.oq import _uses_quantized_source_sensitivity
+
+        assert (
+            _uses_quantized_source_sensitivity(
+                {"quantization_config": {"quant_method": "mxfp8"}}
+            )
+            is True
+        )
+        assert (
+            _uses_quantized_source_sensitivity(
+                {
+                    "model_type": "deepseek_v4",
+                    "quantization_config": {"quant_method": "fp8"},
+                }
+            )
+            is True
+        )
+        assert (
+            _uses_quantized_source_sensitivity(
+                {
+                    "model_type": "glm_moe_dsa",
+                    "quantization_config": {"quant_method": "fp8"},
+                }
+            )
+            is False
+        )
+
+    def test_compressed_tensors_float_quantized_is_quantizable(self):
+        # Laguna-style FP8: fp8 weights + block scales the lazy index dequants
+        assert (
+            validate_quantizable(
+                {
+                    "quantization_config": {
+                        "quant_method": "compressed-tensors",
+                        "format": "float-quantized",
+                    }
+                }
+            )
+            is True
+        )
+
+    def test_compressed_tensors_packed_not_quantizable(self):
+        # pack-quantized / nvfp4-pack-quantized carry true low-bit weights
+        for fmt in ("pack-quantized", "nvfp4-pack-quantized"):
+            assert (
+                validate_quantizable(
+                    {
+                        "quantization_config": {
+                            "quant_method": "compressed-tensors",
+                            "format": fmt,
+                        }
+                    }
+                )
+                is False
+            )
+
     def test_non_fp8_quantization_config(self):
         # Other quant methods (gptq, awq) are already quantized
         assert (
@@ -1044,6 +1139,38 @@ class TestLevelBudgetPlan:
         boost = plan.boost_map.get("model.layers.0.mlp.switch_mlp.down_proj")
         assert boost is not None
         assert boost["bits"] == 4
+
+    def test_glm_dsa_indexer_q8_is_seeded_outside_budget_cap(self):
+        paths = [
+            "model.layers.0.self_attn.indexer.wq_b",
+            "model.layers.0.self_attn.indexer.wk",
+            "model.layers.0.self_attn.indexer.weights_proj",
+            "mtp.0.block.self_attn.indexer.wq_b",
+            "mtp.0.block.self_attn.indexer.wk",
+            "mtp.0.block.self_attn.indexer.weights_proj",
+        ]
+        named_shapes = {path: (64, 64) for path in paths}
+        named_shapes["model.layers.0.mlp.switch_mlp.gate_proj"] = (8, 64, 64)
+        config = {
+            "model_type": "glm_moe_dsa",
+            "num_hidden_layers": 1,
+            "num_experts": 8,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 0.0},
+        }
+        plan = _build_quant_plan(
+            named_shapes,
+            config,
+            3.5,
+            target_bpw=3.01,
+            hard_cap_bpw=3.02,
+        )
+        for path in paths:
+            assert plan.boost_map[path] == {
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine",
+            }
 
     def test_oq35_predicate_floor_for_expert_down_proj(self):
         """The non-budget predicate floor mirrors the oQ3.5 mandatory boost."""
@@ -1829,6 +1956,28 @@ class TestOQECalibrationData:
         assert max(shares.values()) <= 0.18
 
 
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestCalibrationSampleDeterminism:
+    """Calibration subsampling must not depend on the global RNG (#2293)."""
+
+    class _ByteTokenizer:
+        def encode(self, text):
+            return list(text.encode("utf-8")[:64])
+
+    def test_builtin_calibration_subset_is_deterministic(self):
+        tokenizer = self._ByteTokenizer()
+        mx.random.seed(111)
+        first = _load_builtin_calibration(
+            tokenizer, "code_multilingual", num_samples=4, seq_length=64
+        )
+        mx.random.seed(222)
+        second = _load_builtin_calibration(
+            tokenizer, "code_multilingual", num_samples=4, seq_length=64
+        )
+        assert first.shape == (4, 64)
+        assert mx.array_equal(first, second).item()
+
+
 # =============================================================================
 # Test _TrackedTensor
 # =============================================================================
@@ -2314,8 +2463,17 @@ class TestBuildProxyForSensitivity:
 
         calls = []
 
-        def _fake_build(model_path, output_path, *, dtype, trust_remote_code=False):
-            calls.append((model_path, output_path, dtype, trust_remote_code))
+        def _fake_build(
+            model_path,
+            output_path,
+            *,
+            dtype,
+            trust_remote_code=False,
+            preserve_mtp=False,
+        ):
+            calls.append(
+                (model_path, output_path, dtype, trust_remote_code, preserve_mtp)
+            )
             output_path.mkdir()
 
         monkeypatch.setattr(_oq, "_build_streaming_proxy_for_sensitivity", _fake_build)
@@ -2325,7 +2483,9 @@ class TestBuildProxyForSensitivity:
             trust_remote_code=True,
         )
 
-        assert calls == [(str(tmp_path / "src_model"), proxy_dir, "bfloat16", True)]
+        assert calls == [
+            (str(tmp_path / "src_model"), proxy_dir, "bfloat16", True, False)
+        ]
         assert proxy_dir.exists()
 
     def test_returns_path_under_system_temp(self, tmp_path):
@@ -3226,6 +3386,88 @@ class TestQuantizeOqStreamingFp8:
         out_shards = list(out.glob("*.safetensors"))
         assert len(out_shards) > 0
 
+    def test_minimax_mxfp8_scale_inv_source_produces_output(self, tmp_path):
+        """MiniMax's F8_E4M3 + U8 weight_scale_inv layout quantizes."""
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        raw_weight = np.random.randint(0, 255, (hidden, hidden), dtype=np.uint8)
+        exponent_scales = np.full((hidden, hidden // 32), 127, dtype=np.uint8)
+        _write_safetensors(
+            str(src / "model.safetensors"),
+            {
+                "model.embed_tokens.weight": np.ones((256, hidden), dtype=np.float16),
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float16
+                ),
+                "model.layers.0.self_attn.q_proj.weight": (
+                    raw_weight.tobytes(),
+                    [hidden, hidden],
+                    "F8_E4M3",
+                ),
+                "model.layers.0.self_attn.q_proj.weight_scale_inv": (
+                    exponent_scales.tobytes(),
+                    [hidden, hidden // 32],
+                    "U8",
+                ),
+                "lm_head.weight": np.ones((256, hidden), dtype=np.float16),
+            },
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_fp8",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                    "quantization_config": {
+                        "quant_method": "mxfp8",
+                        "weight_block_size": [1, 32],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        out = tmp_path / "out"
+
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        from safetensors import safe_open
+
+        out_keys = set()
+        for shard in out.glob("*.safetensors"):
+            with safe_open(str(shard), framework="numpy") as handle:
+                out_keys.update(handle.keys())
+        assert "model.layers.0.self_attn.q_proj.scales" in out_keys
+        assert not any(key.endswith("weight_scale_inv") for key in out_keys)
+
+    def test_mxfp8_source_uses_quantized_sensitivity_path(self, tmp_path, monkeypatch):
+        from omlx import oq as oq_module
+
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, n_layers=1, hidden=64, fp8_convention="mxfp")
+        config = json.loads((src / "config.json").read_text(encoding="utf-8"))
+        config["quantization_config"] = {"quant_method": "mxfp8"}
+        (src / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+        standard_measure = MagicMock(
+            side_effect=AssertionError("raw QDQ sensitivity path used")
+        )
+        quantized_measure = MagicMock(return_value={0: 0.1})
+        monkeypatch.setattr(oq_module, "_measure_sensitivity", standard_measure)
+        monkeypatch.setattr(
+            oq_module,
+            "_measure_sensitivity_from_quantized_model",
+            quantized_measure,
+        )
+
+        quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)
+
+        standard_measure.assert_not_called()
+        quantized_measure.assert_called_once()
+
     def test_no_scale_keys_in_output(self, tmp_path):
         """Scale keys are consumed by dequant, never written to output."""
         src = tmp_path / "src"
@@ -3943,6 +4185,29 @@ class TestMeasureSensitivityVlmMtp:
         )
 
         assert mock_load.call_args.kwargs["trust_remote_code"] is True
+
+
+class TestCollectImatrixTextLoad:
+    def test_uses_compat_loader_without_trust_remote_code(self, monkeypatch):
+        """oQe calibration works with current mlx-lm, which removed this kwarg."""
+        from omlx import oq as oq_mod
+        import omlx.utils.model_loading as real_ml
+
+        mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
+        monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", False)
+        monkeypatch.setattr(real_ml, "_has_mtp_heads", MagicMock(return_value=False))
+        monkeypatch.setattr(
+            real_ml, "_checkpoint_has_mtp_weights", MagicMock(return_value=False)
+        )
+        monkeypatch.setattr(real_ml, "maybe_apply_pre_load_patches", MagicMock())
+        monkeypatch.setattr(
+            oq_mod, "_collect_imatrix_from_model", MagicMock(return_value=({}, {}))
+        )
+
+        oq_mod._collect_imatrix("/fake/text", {}, trust_remote_code=True)
+
+        assert "trust_remote_code" not in mock_load.call_args.kwargs
 
 
 class TestMeasureSensitivityQuantizedVlm:

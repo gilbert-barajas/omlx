@@ -588,7 +588,36 @@ class Compressor(nn.Module):
             )
             kv = mx.unflatten(ready_kv, 1, (-1, self.compress_ratio))
             gate = mx.unflatten(ready_gate, 1, (-1, self.compress_ratio))
-            new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+
+            # Overlap (ratio==4) pools each window from its own lane-B plus the
+            # previous window's lane-A. _overlap_compress_kv gets lane-A via
+            # `kv_a[:, :-1]` (window-axis shift), which collapses to zero-
+            # padding when only one window is in view (every decode step, and
+            # the first window of any prefill/verify chunk). Prepend the last
+            # completed window carried in the cache so the shift sees a real
+            # predecessor; drop the prepend's own (zero lane-A) pooled output.
+            # Mirrors native DS4's rolling state_kv double buffer
+            # (ds4.c compressor_decode_one). The carry is per batch row: rows
+            # without a valid prev come back -inf gated so the kernel masks
+            # their lane-A exactly like its own first-window padding. rope
+            # runs on the current windows only with pool_base, so positions
+            # stay aligned.
+            prev_kv = prev_gate = None
+            if self.overlap and pool_cache is not None:
+                prev_kv, prev_gate = pool_cache.prev_for_prepend()
+            if prev_kv is not None:
+                kv = mx.concatenate([prev_kv, kv], axis=1)
+                gate = mx.concatenate([prev_gate, gate], axis=1)
+                new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+                new_pooled = new_pooled[:, 1:]
+            else:
+                new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+
+            if self.overlap and pool_cache is not None:
+                pool_cache.store_prev(
+                    kv, gate, dropped=1 if prev_kv is not None else 0
+                )
+
             new_pooled = self.norm(new_pooled)
             new_pooled = self.rope(
                 new_pooled[:, None],
@@ -1234,6 +1263,19 @@ class Model(nn.Module):
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
                     nk = nk.replace(f".hc_{sub}_{param}", f".{sub}_hc.{param}")
+            skip = False
+            for old, new in (
+                (".hc_attn.", ".attn_hc."),
+                (".hc_ffn.", ".ffn_hc."),
+            ):
+                if old in nk:
+                    candidate = nk.replace(old, new)
+                    if candidate in weights or candidate in remapped:
+                        skip = True
+                        break
+                    nk = candidate
+            if skip:
+                continue
             for old, new in w_remap.items():
                 nk = nk.replace(f".shared_experts.{old}.", f".shared_experts.{new}.")
             remapped[nk] = v

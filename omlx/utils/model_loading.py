@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,45 @@ def expand_glm_moe_dsa_fused_quant_keys(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_laguna_compressed_quant(cfg: dict) -> dict:
+    """Map Laguna compressed-tensors metadata to mlx-lm quantization settings.
+
+    mlx-lm's legacy compressed-tensors handling assumes int4 affine
+    ``{group_size: 32, bits: 4}``, which is wrong for Laguna's float-quantized
+    (FP8) and nvfp4-pack-quantized checkpoints. Setting
+    ``config["quantization"]`` short-circuits that legacy branch; the vendored
+    Laguna ``sanitize`` converts the tensors to match these settings.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    if cfg.get("model_type") != "laguna":
+        return cfg
+    if isinstance(cfg.get("quantization"), dict):
+        return cfg
+    qc = cfg.get("quantization_config")
+    if not isinstance(qc, dict) or qc.get("quant_method") != "compressed-tensors":
+        return cfg
+
+    group = qc.get("config_groups", {}).get("group_0", {})
+    fmt = qc.get("format") or group.get("format")
+    weights = group.get("weights") or {}
+    if fmt == "float-quantized":
+        # FP8 block weights are requantized to 8-bit affine by sanitize.
+        cfg["quantization"] = {"group_size": 64, "bits": 8}
+    elif fmt == "nvfp4-pack-quantized":
+        cfg["quantization"] = {
+            "group_size": weights.get("group_size", 16),
+            "bits": weights.get("num_bits", 4),
+            "mode": "nvfp4",
+        }
+    elif fmt == "pack-quantized":
+        cfg["quantization"] = {
+            "group_size": weights.get("group_size", 32),
+            "bits": weights.get("num_bits", 4),
+        }
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -145,6 +185,7 @@ def _patch_mlx_lm_load_config() -> None:
         cfg = _original(model_path, *args, **kwargs)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
+        normalize_laguna_compressed_quant(cfg)
         return cfg
 
     _lu.load_config = _patched
@@ -200,6 +241,15 @@ def maybe_apply_pre_load_patches(
 
     _patch_mlx_lm_load_config()
 
+    # Machine-conditioned, model-independent: reroute sorted gather_qmm
+    # around the defective M5 NAX kernels (issue #2267). Install is cheap
+    # and self-gating — a canary at the first matching call decides
+    # whether to intervene at all.
+    from ..patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
+
+    if apply_m5_gather_qmm_workaround():
+        logger.info("M5 sorted gather_qmm reroute installed (issue #2267)")
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return
@@ -210,6 +260,44 @@ def maybe_apply_pre_load_patches(
             "Could not read %s for pre-load patch dispatch: %s", config_path, e
         )
         return
+
+    # Bonsai t5 load patch must run FIRST — before any other patch that wraps
+    # load_weights on a model subclass (e.g. mlx_vlm_mtp qwen35_vlm_runtime).
+    # Those patches capture cls.load_weights as original_load_weights; if our
+    # patch isn't already on nn.Module.load_weights at that point, the MTP
+    # wrapper chain bypasses us entirely.
+    quant_cfg = config.get("quantization") or {}
+    quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
+    if quant_bits in (1, 2):
+        try:
+            from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
+        except Exception as e:
+            logger.debug("bonsai t5 load patch import failed: %s", e)
+        else:
+            if apply_bonsai_t5_load_patch():
+                logger.info(
+                    "Bonsai t5 load patch applied for %s "
+                    "(t5 uint8 weights allowed past strict shape check)",
+                    model_name,
+                )
+
+    # Bonsai 1-bit construction patch: stock mlx-lm calls
+    # nn.quantize(model, bits=1) before our inference patches hook in,
+    # and mx.quantize(bits=1) is rejected at the C++ level.  Patch
+    # mx.quantize to emit uint32-packed placeholder tensors in the 1-bit
+    # shape (K//32 values per uint32); real weights bind via load_weights.
+    # bits=2 needs no shim (stock mx.quantize handles it).
+    if quant_bits == 1:
+        try:
+            from ..patches.bonsai_qmv import apply_bonsai_construct_patch
+        except Exception as e:
+            logger.debug("bonsai construct patch import failed: %s", e)
+        else:
+            if apply_bonsai_construct_patch():
+                logger.info(
+                    "Bonsai 1-bit construct patch applied for %s",
+                    model_name,
+                )
 
     model_type = config.get("model_type")
     if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
@@ -223,6 +311,20 @@ def maybe_apply_pre_load_patches(
 
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
+
+    if model_type == "laguna":
+        # MLX-LM dynamically imports the architecture and tokenizer-configured
+        # parser during ``lm_load_compat``; register both before that load starts.
+        from ..patches.laguna import apply_laguna_patch
+
+        if apply_laguna_patch():
+            logger.info("Laguna pre-load patch applied for %s", model_name)
+
+    if model_type == "hy_v3":
+        from ..patches.hy_v3 import apply_hy_v3_patch
+
+        if apply_hy_v3_patch():
+            logger.info("Hy3 pre-load patch applied for %s", model_name)
 
     text_config = config.get("text_config")
     text_model_type = (
@@ -264,6 +366,17 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type == "unlimited-ocr":
+        from ..patches.mlx_vlm_unlimited_ocr_compat import (
+            apply_mlx_vlm_unlimited_ocr_compat_patch,
+        )
+
+        if apply_mlx_vlm_unlimited_ocr_compat_patch():
+            logger.info(
+                "Unlimited-OCR mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
     # for *sanitize correctness*: stock mlx-lm Model.sanitize triggers a
@@ -286,10 +399,28 @@ def maybe_apply_pre_load_patches(
         from ..patches.mlx_lm_mtp import (
             apply_mlx_lm_mtp_patch,
             set_mtp_active,
+            set_mtp_depth,
         )
 
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
+            # mtp_num_draft_tokens is the MAX draft depth; an adaptive
+            # controller picks 1..max per sequence from rolling accept/latency
+            # estimates, so prose/chat settles at 1 and predictable text
+            # climbs. Set it to 1 for a fixed depth-1 cycle. Note: depth >= 2
+            # verify forwards route through the verify-shape qmm kernels
+            # (M >= 3), whose numerics can diverge from the unrouted path at
+            # bf16 tail-ULP level.
+            depth = getattr(model_settings, "mtp_num_draft_tokens", None)
+            if depth:
+                set_mtp_depth(int(depth))
+            elif model_type.startswith("nemotron_h"):
+                # The stock nemotron_h head is depth-1 trained; the adaptive
+                # controller's exploration costs ~10% throughput vs fixed
+                # depth 1 on it.
+                set_mtp_depth(1)
+            else:
+                set_mtp_depth(3)
             if mtp_enabled:
                 logger.info(
                     "Native MTP patch applied for %s (model_type=%s, active)",
@@ -439,6 +570,32 @@ def maybe_apply_pre_load_patches(
                     model_name,
                 )
 
+    # Bonsai 1-bit / 2-bit affine quantized decode patch.
+    # Applies to any model whose top-level ``quantization`` config declares
+    # bits=1 or bits=2 (the keys written by the Bonsai MLX conversion).
+    # The patch is a no-op for stock 4/8-bit models so it is safe to install
+    # globally once for the process lifetime.
+    quant_cfg = config.get("quantization") or {}
+    quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
+    if quant_bits in (1, 2):
+        try:
+            from ..patches.bonsai_qmv import apply_bonsai_qmv_patch
+        except Exception as e:
+            logger.debug("bonsai qmv patch import failed: %s", e)
+        else:
+            if apply_bonsai_qmv_patch():
+                logger.info(
+                    "Bonsai %d-bit qmv decode patch applied for %s",
+                    quant_bits,
+                    model_name,
+                )
+            else:
+                logger.debug(
+                    "Bonsai qmv patch skipped for %s "
+                    "(native extension not available; stock mlx fallback active)",
+                    model_name,
+                )
+
 
 def _has_mtp_heads(config: dict) -> bool:
     """True iff the model config declares any MTP head layers."""
@@ -462,8 +619,33 @@ _MTP_WEIGHT_PREFIXES = (
 )
 
 
+def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
+    """Weight-key prefixes for MTP layers stored as extra decoder layers.
+
+    DeepSeek-V3-style checkpoints (GLM-5.2 among them) keep their MTP head
+    as ``model.layers.<num_hidden_layers + i>.*`` rather than ``mtp.*``;
+    the model patch's sanitize remaps them at load/convert time, so for
+    detection purposes those layers count as MTP weights.
+    """
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except Exception:
+        return ()
+    cfgs = (config, config.get("text_config") or {})
+    n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
+    if n_mtp <= 0:
+        return ()
+    n_main = max(int(c.get("num_hidden_layers", 0) or 0) for c in cfgs)
+    if n_main <= 0:
+        return ()
+    return tuple(f"model.layers.{n_main + i}." for i in range(n_mtp))
+
+
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
-    """True iff the checkpoint at *model_path* ships any ``mtp.*`` weight tensor.
+    """True iff the checkpoint at *model_path* ships any MTP weight tensor.
+
+    Matches both the ``mtp.*`` naming and the nextn layout (extra decoder
+    layers past ``num_hidden_layers``, see ``_nextn_weight_prefixes``).
 
     Some Qwen3.6 MoE VLM exports declare ``mtp_num_hidden_layers > 0`` in
     ``config.json`` but strip the MTP weights during conversion (e.g.
@@ -481,12 +663,14 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     if not p.is_dir():
         return False
 
+    prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(p)
+
     index_path = p / "model.safetensors.index.json"
     if index_path.exists():
         try:
             data = json.loads(index_path.read_text())
             weight_map = data.get("weight_map") or {}
-            return any(k.startswith(_MTP_WEIGHT_PREFIXES) for k in weight_map)
+            return any(k.startswith(prefixes) for k in weight_map)
         except Exception as e:
             logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
 
@@ -503,7 +687,7 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
         try:
             with safetensors.safe_open(str(shard), framework="numpy") as f:
                 for k in f.keys():
-                    if k.startswith(_MTP_WEIGHT_PREFIXES):
+                    if k.startswith(prefixes):
                         return True
         except Exception as e:
             logger.debug("Failed to read %s header for mtp weight scan: %s", shard, e)
@@ -513,9 +697,10 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     """Decide whether the native MTP patch can be applied to this model.
 
-    Phase 1 supports Qwen3.5/3.6 (mlx-lm PR 990) and DeepSeek-V4-Flash
-    (Blaizzy/mlx-lm fork PR 15). The model also has to declare MTP heads
-    in the config; otherwise the patch is a no-op.
+    Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
+    fork PR 15), GLM-5.2 (glm_moe_dsa) and Nemotron-H hybrids (nemotron_h).
+    The model also has to declare MTP heads in the config; otherwise the
+    patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -525,6 +710,8 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
         or model_type.startswith("deepseek_v4")
+        or model_type.startswith("nemotron_h")
+        or model_type == "glm_moe_dsa"
     )
 
 
@@ -560,6 +747,40 @@ def materialize_lazy_state(model: Any) -> None:
     makes every leaf array safe to read from any thread afterwards.
     """
     arrays = [v for _, v in tree_flatten(model) if isinstance(v, mx.array)]
+
+    # tree_flatten only descends Module/list/dict containers and skips
+    # underscore-prefixed attributes. Lazy arrays held by plain helper
+    # objects hung off modules (e.g. mlx-vlm's PixtralRotaryEmbedding, a
+    # non-Module class whose inv_freq is built at construction time) stay
+    # invisible to it and keep their loader-thread stream binding. Scan one
+    # attribute level below every module for such containers as well.
+    def _scan_plain_object(obj: Any) -> None:
+        for attr in vars(obj).values():
+            if isinstance(attr, mx.array):
+                arrays.append(attr)
+
+    modules = model.modules() if hasattr(model, "modules") else []
+    for module in modules:
+        # nn.Module splits attribute storage: arrays and containers live in
+        # the Module's dict payload (where tree_flatten skips underscore
+        # keys), while plain helper objects land in the instance __dict__.
+        values = list(vars(module).values())
+        if isinstance(module, dict):
+            values.extend(dict.values(module))
+        for value in values:
+            if isinstance(value, mx.array):
+                arrays.append(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if not isinstance(item, (nn.Module, mx.array)) and hasattr(
+                        item, "__dict__"
+                    ):
+                        _scan_plain_object(item)
+            elif not isinstance(value, (nn.Module, dict)) and hasattr(
+                value, "__dict__"
+            ):
+                _scan_plain_object(value)
+
     if arrays:
         mx.eval(arrays)
 
@@ -568,6 +789,8 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     """Apply optional post-load model transforms based on settings.
 
     Currently supports:
+    - Bonsai t5: free unused bias tensors (the symmetric t5 kernels never
+      read them; the repacked safetensors carries them for format compat)
     - IndexCache: skip redundant indexer computation in DSA layers
 
     Args:
@@ -577,6 +800,18 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     Returns:
         The (possibly patched) model.
     """
+    # t5 bias recovery for text-engine loads (~420 MB on Bonsai-27B).
+    # VLMBatchedEngine calls free_t5_biases explicitly; this covers the
+    # BatchedEngine / LLM path, and is a no-op for non-t5 models.
+    try:
+        from ..patches.bonsai_t5_load import free_t5_biases
+
+        freed = free_t5_biases(model)
+        if freed > 0:
+            logger.info("t5 bias tensors freed: %.0f MB recovered", freed / 1e6)
+    except Exception:
+        logger.debug("t5 bias free skipped", exc_info=True)
+
     if model_settings is None:
         return model
 
